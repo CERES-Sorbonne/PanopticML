@@ -4,8 +4,8 @@ import pickle
 import faiss
 import numpy as np
 
-from .similarity import get_text_vectors
-from ..models import VectorType
+from compute.similarity import get_text_vectors
+from models import VectorType
 from panoptic.core.plugin.plugin import APlugin
 
 

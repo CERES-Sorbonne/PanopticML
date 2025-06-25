@@ -1,13 +1,21 @@
+from enum import Enum
+
 from PIL import Image
 import numpy as np
 
-def get_transformer(model="mobilenet"):
-    if model == "mobilenet":
-        return GoogleTransformer()
-    elif model == "clip":
-        return CLIPTransformer()
-    else:
-        return GoogleTransformer()
+class TransformerName(Enum):
+    mobilenet = "mobilenet"
+    clip = "clip"
+    siglip = "siglip"
+
+def get_transformer(model: TransformerName=TransformerName.clip):
+    match model:
+        case TransformerName.mobilenet:
+            return GoogleTransformer()
+        case TransformerName.clip:
+            return CLIPTransformer()
+        case TransformerName.siglip:
+            return SIGLIPTransformer()
 
 class Transformer(object):
     def __init__(self):
@@ -41,10 +49,13 @@ class GoogleTransformer(Transformer):
 class CLIPTransformer(Transformer):
     def __init__(self):
         super().__init__()
-        from transformers import CLIPModel, CLIPProcessor, CLIPTokenizer
-        self.model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(self.device)
-        self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-        self.tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
+        # from transformers import CLIPModel, CLIPProcessor, CLIPTokenizer
+        from transformers import AutoModel, AutoTokenizer, AutoProcessor
+        ckpt = "openai/clip-vit-base-patch32"
+        self.model = AutoModel.from_pretrained(ckpt).to(self.device)
+        self.tokenizer = AutoTokenizer.from_pretrained(ckpt)
+        self.processor = AutoProcessor.from_pretrained(ckpt)
+
 
     @property
     def can_handle_text(self):
@@ -69,3 +80,30 @@ class CLIPTransformer(Transformer):
         return embedding_as_np.reshape(1, -1)
 
 
+class SIGLIPTransformer(Transformer):
+    def __init__(self):
+        super().__init__()
+        from transformers import AutoModel, AutoTokenizer, AutoProcessor
+        ckpt = "google/siglip2-so400m-patch16-naflex"
+        self.model = AutoModel.from_pretrained(ckpt).to(self.device)
+        self.tokenizer = AutoTokenizer.from_pretrained(ckpt)
+        self.processor = AutoProcessor.from_pretrained(ckpt)
+
+    @property
+    def can_handle_text(self):
+        return True
+
+    def to_vector(self, image: Image) -> np.ndarray:
+        inputs = (self.processor(images=[image], return_tensors="pt")
+                  .to(self.device))
+        image_embeddings = self.model.get_image_features(**inputs)
+        embedding_as_np = image_embeddings.cpu().detach().numpy()
+        return embedding_as_np[0]
+
+
+    def to_text_vector(self, text: str) -> np.ndarray:
+        inputs = self.tokenizer(text=text, return_tensors="pt").to(self.device)
+        text_embeddings = self.model.get_text_features(**inputs)
+        # Convertir les embeddings en tableau numpy
+        embedding_as_np = text_embeddings.cpu().detach().numpy()
+        return embedding_as_np.reshape(1, -1)

@@ -13,7 +13,7 @@ from panoptic.utils import group_by_sha1
 from .compute import make_clusters
 from .compute.faiss_tree import load_faiss_tree, create_faiss_tree, FaissTree
 from .compute.similarity import get_text_vectors
-from .compute.transformers import get_transformer
+from .compute.transformers import get_transformer, TransformerName
 from .compute_vector_task import ComputeVectorTask
 from .models import VectorType
 
@@ -102,8 +102,8 @@ class PanopticML(APlugin):
         task = ComputeVectorTask(self, self.name, vector, instance, self.data_path)
         self.project.add_task(task)
 
-    async def compute_clusters(self, context: ActionContext, vec_type: VectorType = VectorType.clip,
-                               nb_clusters: int = 10): #, label_clusters: bool = False):
+    async def compute_clusters(self, context: ActionContext, vec_type: VectorType = VectorType.rgb,
+                               nb_clusters: int = 10, label_clusters: bool = False):
         """
         Computes images clusters with Faiss Kmeans
         @nb_clusters: requested number of clusters
@@ -133,7 +133,6 @@ class PanopticML(APlugin):
         labels = []
         i = 0
         # TODO: put back mistral when it's working properly
-        label_clusters = False
         if label_clusters:
             from mistral_test import create_labels_from_group, generate_group_image
         for cluster, distance in zip(clusters, distances):
@@ -151,7 +150,7 @@ class PanopticML(APlugin):
 
         return ActionResult(groups=groups)
 
-    async def find_images(self, context: ActionContext, vec_type: VectorType = VectorType.clip):
+    async def find_images(self, context: ActionContext, vec_type: VectorType = VectorType.rgb):
         """
         Find Similar images using Cosine distances.
         dist: 0 -> images are considered highly dissimilar
@@ -191,7 +190,7 @@ class PanopticML(APlugin):
         res = Group(sha1s=res_sha1s, scores=res_scores)
         return ActionResult(groups=[res])
 
-    async def search_by_text(self, context: ActionContext, vec_type: VectorType = VectorType.clip, text: str = '', min_similarity: float = 0.5):
+    async def search_by_text(self, context: ActionContext, vec_type: VectorType = VectorType.rgb, text: str = '', min_similarity: float = 0.5):
         """Search image using text similarity"""
         if text == '':
             notif = Notif(type=NotifType.ERROR, name="EmptySearchText",
@@ -208,13 +207,13 @@ class PanopticML(APlugin):
             return ActionResult(notifs=[notif])
 
         try:
-            text_instances = tree.query_texts([text], self.transformer)
+            resulting_images = tree.query_texts([text], self.transformer)
         except ValueError as e:
             return ActionResult(notifs=[Notif(type=NotifType.ERROR, name="TextSimilarityError", message=str(e))])
 
 
         # filter out images if they are not in the current context
-        filtered_instances = [inst for inst in text_instances if inst['sha1'] in context_sha1s]
+        filtered_instances = [inst for inst in resulting_images if inst['sha1'] in context_sha1s]
 
         index = {r['sha1']: r['dist'] for r in filtered_instances}
         res_sha1s = np.asarray(list(index.keys()))
@@ -230,7 +229,7 @@ class PanopticML(APlugin):
         res.name = "Text Search: " + text
         return ActionResult(groups=[res])
 
-    async def cluster_by_tags(self, context: ActionContext, tags: PropertyId, vec_type: VectorType = VectorType.clip):
+    async def cluster_by_tags(self, context: ActionContext, tags: PropertyId, vec_type: VectorType = VectorType.rgb):
         """Cluster images using a Tag/MultiTag property to guide the result"""
         props = await self.project.get_properties(ids=[tags])
         tag_prop = props[0]
@@ -315,7 +314,7 @@ class PanopticML(APlugin):
         for vector, sha1 in zip(vectors, sha1s):
             if sha1 in already_in_clusters:
                 continue
-            tree = await self._get_tree(VectorType.clip)
+            tree = await self._get_tree(VectorType.rgb)
             res = tree.query([vector.data], 150)
             filtered = [r for r in res if r['dist'] >= min_similarity and r['sha1'] in sha1s]
             res_sha1s = [r['sha1'] for r in filtered]
@@ -351,4 +350,4 @@ class PanopticML(APlugin):
         return tree
 
     def _load_transformer(self):
-        return get_transformer(self.params.model)
+        return get_transformer(TransformerName[self.params.model])
