@@ -7,6 +7,7 @@ path = "version.py"
 
 [project]
 name = "panopticml"
+dynamic = ["version"]
 authors = [
   { name="Félix Alié", email="felix.alie@sorbonne-universite.fr" },
 ]
