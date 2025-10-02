@@ -1,5 +1,6 @@
 import faiss
 import numpy as np
+import sklearn
 import torch
 
 from panoptic.models import Vector
@@ -14,17 +15,17 @@ def make_clusters(vectors: list[Vector], **kwargs) -> (list[list[str]], list[int
     sha1 = np.asarray(sha1)
     clusters: np.ndarray
 
-    clusters, distances = _make_clusters_faiss(vectors, **kwargs)
+    clusters, scores = _make_clusters_faiss(vectors, **kwargs)
 
     for cluster in list(set(clusters)):
         sha1_cluster = sha1[clusters == cluster]
-        current_cluster_distances = distances[clusters == cluster]
-        if distances is not None:
-            res_distances.append(np.mean(current_cluster_distances))
+        # current_cluster_distances = distances[clusters == cluster]
+        # if distances is not None:
+        #     res_distances.append(np.mean(current_cluster_distances))
         res_clusters.append(list(sha1_cluster))
     # sort clusters by distances
-    sorted_clusters = [cluster for _, cluster in sorted(zip(res_distances, res_clusters))]
-    return sorted_clusters, sorted(res_distances)
+    sorted_clusters = [cluster for _, cluster in sorted(zip(scores, res_clusters), reverse=True)]
+    return sorted_clusters, [ x * 100 for x in sorted(scores, reverse=True)]
 
 
 def _make_clusters_faiss(vectors, nb_clusters=6, **kwargs) -> (np.ndarray, np.ndarray):
@@ -39,24 +40,31 @@ def _make_clusters_faiss(vectors, nb_clusters=6, **kwargs) -> (np.ndarray, np.nd
         clusterer = hdbscan.HDBSCAN(min_cluster_size=5, gen_min_span_tree=True)
         clusterer.fit(vectors)
         indices = clusterer.labels_
-        probabilities = clusterer.probabilities_
-        distances = np.zeros_like(probabilities, dtype=np.float32)
-        unique_clusters = np.unique(indices)
+        # probabilities = clusterer.probabilities_
+        # distances = np.zeros_like(probabilities, dtype=np.float32)
+        # unique_clusters = np.unique(indices)
         # compute distances just like the one returned by kmeans to have consistent metrics
-        for cluster_id in unique_clusters:
-            if cluster_id == -1:
-                distances[indices == -1] = 100.0
-                continue
-            cluster_mask = (indices == cluster_id)
-            cluster_vectors = vectors[cluster_mask]
-            cluster_probabilities = probabilities[cluster_mask]
-            center_local_index = np.argmax(cluster_probabilities)
-            center_vector = cluster_vectors[center_local_index].reshape(1, -1)
-            dists = faiss.pairwise_distances(center_vector, cluster_vectors)[0]
-            distances[cluster_mask] = dists
+        # for cluster_id in unique_clusters:
+        #     if cluster_id == -1:
+        #         distances[indices == -1] = 100.0
+        #         continue
+        #     cluster_mask = (indices == cluster_id)
+        #     cluster_vectors = vectors[cluster_mask]
+        #     cluster_probabilities = probabilities[cluster_mask]
+        #     center_local_index = np.argmax(cluster_probabilities)
+        #     center_vector = cluster_vectors[center_local_index].reshape(1, -1)
+        #     dists = faiss.pairwise_distances(center_vector, cluster_vectors)[0]
+        #     distances[cluster_mask] = dists
     else:
         distances, indices = _make_single_kmean(vectors, nb_clusters)
-    return indices.flatten(), distances.flatten()
+    # compute silhouette per cluster
+    unique_clusters = np.unique(indices)
+    sscores = sklearn.metrics.silhouette_samples(vectors, indices)
+    ssscores_per_cluster =  []
+    for cluster in unique_clusters:
+        cluster_mask = indices[indices == cluster]
+        ssscores_per_cluster.append(np.mean(sscores[cluster_mask]))
+    return indices.flatten(), ssscores_per_cluster
 
 
 def cluster_by_text(image_vectors: list[Vector], text_vectors: list[np.array], text_labels: list[str]) -> list[Group]:

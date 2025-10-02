@@ -131,7 +131,7 @@ class PanopticML(APlugin):
                                         Compute the vectors and try again.) """,
                                 functions=self._get_vector_func_notifs(vec_type))
             return ActionResult(notifs=[empty_notif])
-        clusters, distances = make_clusters(vectors, method="kmeans", nb_clusters=nb_clusters)
+        clusters, scores = make_clusters(vectors, method="kmeans", nb_clusters=nb_clusters)
         groups = []
         groups_images = []
         labels = []
@@ -139,8 +139,8 @@ class PanopticML(APlugin):
         # TODO: put back mistral when it's working properly
         if label_clusters:
             from .mistral_test import create_labels_from_group, generate_group_image
-        for cluster, distance in zip(clusters, distances):
-            group = Group(score=Score(min=0, max=100, max_is_best=False, value=distance))
+        for cluster, score in zip(clusters, scores):
+            group = Group(score=Score(min=-100, max=100, max_is_best=True, value=score))
             if label_clusters:
                 images = [sha1_to_instance[sha1][0].url for sha1 in cluster[:20]]
                 groups_images.append(generate_group_image(images, i))
