@@ -39,7 +39,6 @@ dependencies = [
     "numpy; platform_system != 'Darwin'",
     "transformers<4.52.0",
     "mistralai",
-    "hdbscan",
     "torchvision",
 ]
 

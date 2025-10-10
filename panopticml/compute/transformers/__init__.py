@@ -4,7 +4,7 @@ import torch
 from PIL import Image
 import numpy as np
 
-from ....panopticml.utils import resolve_device
+from panopticml.utils import resolve_device
 
 
 class TransformerName(Enum):
