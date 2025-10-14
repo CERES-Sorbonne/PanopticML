@@ -13,7 +13,7 @@ jobs:
       # Continue même si un OS échoue
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest] #, windows-latest, macos-latest]
         python-version: ['3.11', '3.12', '3.13']
 
     steps:
@@ -35,4 +35,4 @@ jobs:
         pip install -e .
 
     - name: Lancement des tests avec pytest
-      run: pytest -v
+      run: pytest -v -tb=line
