@@ -1,5 +1,6 @@
 import faiss
 import numpy as np
+from sklearn.cluster import HDBSCAN
 import torch
 
 from panoptic.models import Vector
@@ -35,7 +36,6 @@ def _make_clusters_faiss(vectors, nb_clusters=6, **kwargs) -> (np.ndarray, np.nd
 
     vectors = np.asarray(vectors)
     if nb_clusters == -1:
-        from sklearn.cluster import HDBSCAN
         clusterer = HDBSCAN(min_cluster_size=5)
         clusterer.fit(vectors)
         indices = clusterer.labels_

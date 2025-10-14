@@ -4,6 +4,7 @@ import requests
 from PIL import Image
 from pydantic import BaseModel
 
+
 from panoptic.core.plugin.plugin import APlugin
 from panoptic.core.plugin.plugin_project_interface import PluginProjectInterface
 from panoptic.models import Instance, ActionContext, PropertyId, PropertyType
