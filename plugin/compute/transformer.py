@@ -6,7 +6,7 @@ import numpy as np
 from transformers import AutoConfig
 
 from panoptic.models import VectorType
-from plugin.utils import resolve_device
+from ..utils import resolve_device
 
 
 def get_model_type(huggingface_model: str):

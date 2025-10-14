@@ -6,7 +6,7 @@ import numpy as np
 
 from panoptic.models import VectorType
 from panoptic.core.plugin.plugin import APlugin
-from plugin.compute.transformer import Transformer
+from .transformer import Transformer
 
 
 class FaissTree:
