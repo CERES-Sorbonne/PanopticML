@@ -57,7 +57,7 @@ def test_image_to_vector(model_name, vector_type, all_models):
         print(f"\n=== Testing {model_name.value.upper()} with image {img_path} ===")
 
         transformer = all_models[model_name]
-        print(f"✓ Transformer {model_name} initialisé avec succès")
+        print(f"Transformer {model_name} initialisé avec succès")
 
         # Tester la conversion d'image en vecteur
         print("Testing image to vector conversion...")
@@ -66,7 +66,7 @@ def test_image_to_vector(model_name, vector_type, all_models):
         # Vérifications
         assert isinstance(image_vector, np.ndarray), f"Le résultat doit être un numpy array pour {model_name}"
         assert image_vector.size > 0, f"Le vecteur ne doit pas être vide pour {model_name}"
-        print(f"✓ Image convertie en vecteur de taille: {image_vector.shape}")
+        print(f"Image convertie en vecteur de taille: {image_vector.shape}")
 
 
 
