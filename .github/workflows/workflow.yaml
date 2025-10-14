@@ -35,4 +35,4 @@ jobs:
         pip install -e .
 
     - name: Lancement des tests avec pytest
-      run: pytest -v -tb=line
+      run: pytest -v --tb=line
