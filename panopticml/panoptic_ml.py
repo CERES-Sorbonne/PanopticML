@@ -1,5 +1,4 @@
 from typing import Dict
-
 import numpy as np
 import requests
 from PIL import Image
