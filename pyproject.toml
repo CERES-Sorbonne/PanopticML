@@ -29,14 +29,14 @@ classifiers = [
 ]
 
 dependencies = [
-    "torch==2.1.0; platform_system == 'Darwin'",
-    "numpy<=1.26.0; platform_system == 'Darwin'",
-    "scikit-learn==1.5.0; platform_system == 'Darwin'",
-    "torch; platform_system != 'Darwin'",
+    #"torch==2.1.0; platform_system == 'Darwin'",
+    # "numpy<=1.26.0; platform_system == 'Darwin'",
+    # "scikit-learn==1.5.0; platform_system == 'Darwin'",
+    "torch" #; platform_system != 'Darwin'",
     "faiss-cpu<1.11.0",
     "scipy",
-    "scikit-learn; platform_system != 'Darwin'",
-    "numpy; platform_system != 'Darwin'",
+    "scikit-learn", # ; platform_system != 'Darwin'",
+    "numpy", #; platform_system != 'Darwin'",
     "transformers<4.52.0",
     "mistralai",
     "torchvision",
