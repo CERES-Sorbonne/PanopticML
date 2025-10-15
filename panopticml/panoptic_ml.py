@@ -1,24 +1,27 @@
 from enum import Enum
 
 import numpy as np
+import requests
+from PIL import Image
 from pydantic import BaseModel
-from sklearn.metrics.pairwise import cosine_similarity
+
 
 from panoptic.core.plugin.plugin import APlugin
 from panoptic.core.plugin.plugin_project_interface import PluginProjectInterface
 from panoptic.models import Instance, ActionContext, PropertyId, PropertyType, VectorType, OwnVectorType
 from panoptic.models.results import Group, ActionResult, Notif, NotifType, NotifFunction, ScoreList, Score
 from panoptic.utils import group_by_sha1
+
 from .compute import make_clusters
 from .compute.clustering import cluster_by_text
 from .compute.faiss_tree import FaissTreeManager
 from .compute.transformer import TransformerManager
 from .compute_vector_task import ComputeVectorTask
+from .utils import is_image_url
 
 
 class PluginParams(BaseModel):
     compute_on_import: bool = True
-    pass
 
 
 class ModelEnum(Enum):
@@ -59,7 +62,6 @@ class PanopticML(APlugin):
         self.trees = FaissTreeManager(self)
         self.transformers = TransformerManager()
 
-    # TODO
     async def start(self):
         await super().start()
 
@@ -111,7 +113,7 @@ class PanopticML(APlugin):
         self.project.add_task(task)
 
     async def compute_clusters(self, context: ActionContext, vec_type: OwnVectorType,
-                               nb_clusters: int = 10, label_clusters: bool = False):
+                               nb_clusters: int = 10): #, label_clusters: bool = False):
         """
         Computes images clusters with Faiss Kmeans
         @nb_clusters: requested number of clusters
@@ -214,10 +216,17 @@ class PanopticML(APlugin):
                           message=f"No Faiss tree could be loaded for vec_type {vec_type.value}")
             return ActionResult(notifs=[notif])
 
+        transformer = self.transformers.get(vec_type)
         try:
-            resulting_images = tree.query_texts([text], self.transformers.get(vec_type))
+            if is_image_url(text):
+                im = Image.open(requests.get(text, stream=True).raw)
+                vec = transformer.to_vector(im)
+                resulting_images = tree.query([vec])
+            else:
+                resulting_images = tree.query_texts([text], self.transformers.get(vec_type))
         except ValueError as e:
             return ActionResult(notifs=[Notif(type=NotifType.ERROR, name="TextSimilarityError", message=str(e))])
+
 
         # filter out images if they are not in the current context
         filtered_instances = [inst for inst in resulting_images if inst['sha1'] in context_sha1s]
@@ -310,3 +319,13 @@ class PanopticML(APlugin):
         types = await self.project.get_vector_types(self.name)
         for type_ in types:
             await self.trees.rebuild_tree(type_)
+
+    def _load_transformer(self):
+        if TransformerName[self.params.model] == TransformerName.auto and not self.params.hugging_face_model:
+            return ActionResult(notifs=[Notif(
+                NotifType.ERROR,
+                name="No hugging face model specified",
+                message=f"""
+                      Automodel selected but no hugging face model provided
+                      """)])
+        return get_transformer(TransformerName[self.params.model], self.params.hugging_face_model)

@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "version.py"
+
+[project]
+name = "panopticml"
+dynamic = ["version"]
+authors = [
+  { name="Félix Alié", email="felix.alie@sorbonne-universite.fr" },
+]
+description = "A package for Panoptic ML"
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: Implementation :: PyPy",
+    "License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Science/Research",
+]
+
+dependencies = [
+    #"torch==2.1.0; platform_system == 'Darwin'",
+    # "numpy<=1.26.0; platform_system == 'Darwin'",
+    # "scikit-learn==1.5.0; platform_system == 'Darwin'",
+    "torch", #; platform_system != 'Darwin'",
+    "faiss-cpu<1.11.0",
+    "scipy",
+    "scikit-learn", # ; platform_system != 'Darwin'",
+    "numpy", #; platform_system != 'Darwin'",
+    "transformers<4.52.0",
+    "mistralai",
+    "torchvision",
+]
+
+
+[project.urls]
+"Homepage" = "https://github.com/CERES-Sorbonne/PanopticML"
+"Bug Tracker" = "https://github.com/CERES-Sorbonne/PanopticML/issues"
+
+[tool.hatch.build.targets.wheel]
+# This configuration ensures that the 'panopticml' directory is treated as the package.
+# When installed, the package can be imported using 'import panopticml'.
+packages = ["panopticml"]

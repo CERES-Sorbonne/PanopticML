@@ -6,10 +6,10 @@ import faiss
 import pytest
 import numpy as np
 
-from plugin.compute.transformer import Transformer, get_transformer
+from panopticml.compute.faiss_tree import FaissTree
+from panopticml.compute.transformers import get_transformer, TransformerName, Transformer
 from plugin.panoptic_ml import ModelEnum
-from ..plugin.compute.faiss_tree import FaissTree
-from ..plugin.utils import preprocess_image, cosine_similarity
+from panopticml.utils import preprocess_image, cosine_similarity
 
 transformers_to_test = [transformer.value for transformer in ModelEnum]
 

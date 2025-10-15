@@ -15,7 +15,8 @@ class FaissTree:
         self.labels = labels
 
     def query(self, vectors: list[np.ndarray], k=999999):
-        vector = np.asarray(vectors)
+        vector_center = np.mean(vectors, axis=0)
+        vector = np.asarray([vector_center])
 
         real_k = min(k, len(self.labels))
         vector = vector.reshape(1, -1)
@@ -64,8 +65,11 @@ def load_faiss_tree(plugin: APlugin, vec_type: int) -> FaissTree | None:
     path = os.path.join(plugin.data_path, name)
     if not os.path.exists(path):
         return None
-    with open(path, 'rb') as f:
-        return pickle.load(f)
+    try:
+        with open(path, 'rb') as f:
+            return pickle.load(f)
+    except ModuleNotFoundError:
+        return None
 
 
 class FaissTreeManager:
