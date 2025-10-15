@@ -7,8 +7,8 @@ import pytest
 import numpy as np
 
 from panopticml.compute.faiss_tree import FaissTree
-from panopticml.compute.transformers import get_transformer, TransformerName, Transformer
-from plugin.panoptic_ml import ModelEnum
+from panopticml.compute.transformers import get_transformer, Transformer
+from panopticml.panoptic_ml import ModelEnum
 from panopticml.utils import preprocess_image, cosine_similarity
 
 transformers_to_test = [transformer.value for transformer in ModelEnum]
@@ -46,7 +46,7 @@ def all_models():
         models[model_name] = get_transformer(model_name)
     return models
 
-@pytest.mark.parametrize("model_name, vector_type", list(product(transformers_to_test, VectorType)))
+@pytest.mark.parametrize("model_name, vector_type", list(product(transformers_to_test, [{'greyscale': False}, {'greyscale': True}])))
 def test_image_to_vector(model_name, vector_type, all_models):
     """Test tous les transformers disponibles"""
     for img_path in get_images():

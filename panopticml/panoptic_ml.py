@@ -142,18 +142,18 @@ class PanopticML(APlugin):
         labels = []
         i = 0
         # TODO: put back mistral when it's working properly
-        if label_clusters:
-            from ..mistral_test import create_labels_from_group, generate_group_image
+        # if label_clusters:
+        #     from ..mistral_test import create_labels_from_group, generate_group_image
         for cluster, distance in zip(clusters, distances):
             group = Group(score=Score(min=0, max=100, max_is_best=False, value=distance))
-            if label_clusters:
-                images = [sha1_to_instance[sha1][0].url for sha1 in cluster[:20]]
-                groups_images.append(generate_group_image(images, i))
-                i += 1
+            # if label_clusters:
+            #     images = [sha1_to_instance[sha1][0].url for sha1 in cluster[:20]]
+            #     groups_images.append(generate_group_image(images, i))
+            #     i += 1
             group.sha1s = sorted(cluster, key=lambda sha1: sha1_to_ahash[sha1])
             groups.append(group)
-        if len(groups_images) > 0:
-            labels = create_labels_from_group(groups_images)
+        # if len(groups_images) > 0:
+        #     labels = create_labels_from_group(groups_images)
         for i, g in enumerate(groups):
             g.name = f"Cluster {i}" if not len(labels) > 0 else "-".join(labels[i])
 
