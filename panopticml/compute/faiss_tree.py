@@ -16,6 +16,11 @@ class FaissTree:
 
     def query(self, vectors: list[np.ndarray], k=999999):
         vector_center = np.mean(vectors, axis=0)
+
+        norm = np.linalg.norm(vector_center)
+        if norm > 0:
+            vector_center = vector_center / norm
+
         vector = np.asarray([vector_center])
 
         real_k = min(k, len(self.labels))
