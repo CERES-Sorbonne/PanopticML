@@ -25,7 +25,8 @@ def make_clusters(vectors: list[Vector], **kwargs) -> (list[list[str]], list[int
         res_clusters.append(list(sha1_cluster))
     # sort clusters by distances
     sorted_clusters = [cluster for _, cluster in sorted(zip(res_distances, res_clusters))]
-    return sorted_clusters, sorted(res_distances)
+    res_distances_scaled = [i * 100 for i in res_distances]
+    return sorted_clusters, sorted(res_distances_scaled)
 
 
 def _make_clusters_faiss(vectors, nb_clusters=6, **kwargs) -> (np.ndarray, np.ndarray):

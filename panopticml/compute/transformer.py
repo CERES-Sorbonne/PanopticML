@@ -131,8 +131,14 @@ class Dinov2Transformer(Transformer):
         inputs = self.processor(images=image, return_tensors="pt").to(self.device)
         with torch.no_grad():
             outputs = self.model(**inputs)
-        return outputs.last_hidden_state.mean(dim=1).cpu().numpy()[0]
+        embedding = outputs.last_hidden_state.mean(dim=1).cpu().numpy()[0]
 
+        # Normalisation L2
+        norm = np.linalg.norm(embedding)
+        if norm > 0:
+            embedding = embedding / norm
+
+        return embedding
 
 type_to_class_mapping = {
     "mobilenet_v2": MobileNetTransformer,
