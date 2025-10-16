@@ -26,7 +26,7 @@ class ComputeVectorTask(Task):
         self.transformer = self.plugin.transformers.get(vec_type)
         self.name = f'{self.transformer.name} Vectors ({vec_type.id})'
         self.data_path = data_path
-        self.key += f"vec_{vec_type.id}"
+        self.key += f"vec_id_{vec_type.id}"
 
     async def run(self):
         instance = self.instance
