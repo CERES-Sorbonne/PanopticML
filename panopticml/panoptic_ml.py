@@ -1,3 +1,20 @@
+import os
+
+from .compute.transformers import TransformerName, get_transformer
+
+
+# deactivate searching for online model if internet is off. Could be made better but works okay for now
+def check_huggingface_connection():
+    import socket
+    try:
+        socket.create_connection(("huggingface.co", 443), timeout=2)
+        return True
+    except (OSError, socket.timeout):
+        os.environ['HF_HUB_OFFLINE'] = '1'
+        return False
+
+check_huggingface_connection()
+
 from enum import Enum
 
 import numpy as np
