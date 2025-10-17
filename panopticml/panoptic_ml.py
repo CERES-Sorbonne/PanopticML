@@ -15,7 +15,8 @@ from panoptic.utils import group_by_sha1
 from .compute import make_clusters
 from .compute.clustering import cluster_by_text
 from .compute.faiss_tree import FaissTreeManager
-from .compute.transformer import TransformerManager
+from .compute.transformer import TransformerManager, get_transformer
+from .compute.transformers import TransformerName
 from .compute_vector_task import ComputeVectorTask
 from .utils import is_image_url
 
