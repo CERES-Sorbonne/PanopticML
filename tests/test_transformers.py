@@ -6,12 +6,12 @@ import faiss
 import pytest
 import numpy as np
 
-from ..panopticml.compute.faiss_tree import FaissTree
-from ..panopticml.compute.transformers import get_transformer, TransformerName, Transformer
-from ..panopticml.models import VectorType
-from ..panopticml.utils import preprocess_image, cosine_similarity
+from panopticml.compute.faiss_tree import FaissTree
+from panopticml.compute.transformers import get_transformer, Transformer
+from panopticml.panoptic_ml import ModelEnum
+from panopticml.utils import preprocess_image, cosine_similarity
 
-transformers_to_test = [transformer for transformer in TransformerName if transformer != TransformerName.auto]
+transformers_to_test = [transformer.value for transformer in ModelEnum]
 
 def create_faiss_tree(vectors, images):
     vectors = np.asarray(vectors)
@@ -46,7 +46,7 @@ def all_models():
         models[model_name] = get_transformer(model_name)
     return models
 
-@pytest.mark.parametrize("model_name, vector_type", list(product(transformers_to_test, VectorType)))
+@pytest.mark.parametrize("model_name, vector_type", list(product(transformers_to_test, [{'greyscale': False}, {'greyscale': True}])))
 def test_image_to_vector(model_name, vector_type, all_models):
     """Test tous les transformers disponibles"""
     for img_path in get_images():

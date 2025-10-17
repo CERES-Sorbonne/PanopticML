@@ -1,19 +1,16 @@
 import io
-
 import numpy as np
 import torch
 import re
 from PIL import Image
 
-from .models import VectorType
 
-
-def preprocess_image(image_data: bytes, vector_type: VectorType = VectorType.rgb):
+def preprocess_image(image_data: bytes, params: dict):
     image = Image.open(io.BytesIO(image_data))
-    if vector_type == VectorType.rgb:
-        image = image.convert('RGB')
-    else:
+    if params.get('greyscale'):
         image = image.convert('L').convert('RGB')
+    else:
+        image = image.convert('RGB')
     return image
 
 def cosine_similarity(embedding1: np.array, embedding2: np.array):

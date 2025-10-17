@@ -4,9 +4,9 @@ import pickle
 import faiss
 import numpy as np
 
-from .similarity import get_text_vectors
-from ..models import VectorType
+from panoptic.models import VectorType
 from panoptic.core.plugin.plugin import APlugin
+from .transformer import Transformer
 
 
 class FaissTree:
@@ -16,6 +16,11 @@ class FaissTree:
 
     def query(self, vectors: list[np.ndarray], k=999999):
         vector_center = np.mean(vectors, axis=0)
+
+        norm = np.linalg.norm(vector_center)
+        if norm > 0:
+            vector_center = vector_center / norm
+
         vector = np.asarray([vector_center])
 
         real_k = min(k, len(self.labels))
@@ -26,19 +31,19 @@ class FaissTree:
         return [{'sha1': self.labels[i], 'dist': float('%.2f' % (distances[index]))} for index, i in
                 enumerate(indices)]
 
-    def query_texts(self, texts: list[str], transformer):
-        text_vectors = get_text_vectors(texts, transformer)
+    def query_texts(self, texts: list[str], transformer: Transformer):
+        text_vectors = transformer.get_text_vectors(texts)
         return self.query(text_vectors)
 
 
-def gen_tree_file_name(vec_type: VectorType):
-    return f"{vec_type.value}_faiss_tree.pkl"
+def gen_tree_file_name(type_id: int):
+    return f"faiss_tree_vec_id_{type_id}.pkl"
 
 
-async def create_faiss_tree(plugin: APlugin, vec_type: VectorType):
+async def create_faiss_tree(plugin: APlugin, type_id: int):
     project = plugin.project
-    name = gen_tree_file_name(vec_type)
-    vectors = await project.get_vectors(plugin.name, vector_type=vec_type.value)
+    name = gen_tree_file_name(type_id)
+    vectors = await project.get_vectors(type_id)
 
     if vectors is None or len(vectors) == 0:
         return
@@ -60,7 +65,7 @@ async def create_faiss_tree(plugin: APlugin, vec_type: VectorType):
     return FaissTree(index=index, labels=sha1_list)
 
 
-def load_faiss_tree(plugin: APlugin, vec_type: VectorType) -> FaissTree | None:
+def load_faiss_tree(plugin: APlugin, vec_type: int) -> FaissTree | None:
     name = gen_tree_file_name(vec_type)
     path = os.path.join(plugin.data_path, name)
     if not os.path.exists(path):
@@ -70,3 +75,31 @@ def load_faiss_tree(plugin: APlugin, vec_type: VectorType) -> FaissTree | None:
             return pickle.load(f)
     except ModuleNotFoundError:
         return None
+
+
+class FaissTreeManager:
+    def __init__(self, plugin: APlugin):
+        self.trees: dict[int, FaissTree] = {}
+        self.plugin = plugin
+
+    async def get(self, vec_type: VectorType):
+        type_id = vec_type.id
+
+        if self.trees.get(type_id):
+            return self.trees[type_id]
+
+        tree = load_faiss_tree(self.plugin, type_id)
+        if tree:
+            self.trees[type_id] = tree
+            return tree
+        tree = await create_faiss_tree(self.plugin, type_id)
+        if tree:
+            self.trees[type_id] = tree
+            return tree
+
+    async def rebuild_tree(self, vec_type: VectorType):
+        type_id = vec_type.id
+        tree = await create_faiss_tree(self.plugin, type_id)
+        self.trees[type_id] = tree
+        print(f"updated vec [{type_id}] faiss tree")
+        return tree
