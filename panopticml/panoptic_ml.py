@@ -85,8 +85,9 @@ class PanopticML(APlugin):
         [await self.trees.get(t) for t in self.vector_types]
 
         if len(self.vector_types) == 0:
-            await self.project.add_vector_type(VectorType(id=-1, source=self.name,
+            vec_type = await self.project.add_vector_type(VectorType(id=-1, source=self.name,
                                                           params={"model": ModelEnum.clip.value, "greyscale": False}))
+            self.vector_types.append(vec_type)
             self.project.ui.update_counter.vector_type += 1
 
     async def create_default_vector_type(self, ctx: ActionContext, model: ModelEnum, greyscale: bool):
