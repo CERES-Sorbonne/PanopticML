@@ -1,6 +1,7 @@
 import os
 
-from .compute.transformers import TransformerName, get_transformer
+from panoptic.core.project.project import Project
+from .compute.transformers import get_transformer
 
 
 # deactivate searching for online model if internet is off. Could be made better but works okay for now
@@ -24,7 +25,6 @@ from pydantic import BaseModel
 
 
 from panoptic.core.plugin.plugin import APlugin
-from panoptic.core.plugin.plugin_project_interface import PluginProjectInterface
 from panoptic.models import Instance, ActionContext, PropertyId, PropertyType, VectorType, OwnVectorType
 from panoptic.models.results import Group, ActionResult, Notif, NotifType, NotifFunction, ScoreList, Score
 from panoptic.utils import group_by_sha1
@@ -62,10 +62,9 @@ class PanopticML(APlugin):
     Uses CLIP to generate vectors and FAISS for clustering / similarity functions
     """
 
-    def __init__(self, project: PluginProjectInterface, plugin_path: str, name: str):
+    def __init__(self, project: Project, plugin_path: str, name: str):
         super().__init__(name=name, project=project, plugin_path=plugin_path)
         self.params: PluginParams = PluginParams()
-
         self.project.on_instance_import(self.compute_image_vectors_on_import)
         self.project.on_folder_delete(self.rebuild_trees)
         self.add_action_easy(self.create_default_vector_type, ['vector_type'])
@@ -86,21 +85,17 @@ class PanopticML(APlugin):
         [await self.trees.get(t) for t in self.vector_types]
 
         if len(self.vector_types) == 0:
-            vec_type = await self.project.add_vector_type(VectorType(id=-1, source=self.name,
+            await self.project.add_vector_type(VectorType(id=-1, source=self.name,
                                                           params={"model": ModelEnum.clip.value, "greyscale": False}))
-            self.vector_types.append(vec_type)
-            self.project.ui.update_counter.vector_type += 1
 
     async def create_default_vector_type(self, ctx: ActionContext, model: ModelEnum, greyscale: bool):
         vec = VectorType(id=-1, source=self.name, params={"model": model.value, "greyscale": greyscale})
         res = await self.project.add_vector_type(vec)
-        await self.load_vector_types()
         return ActionResult(value=res)
 
     async def create_custom_vector_type(self, ctx: ActionContext, model: str, greyscale: bool):
         vec = VectorType(id=-1, source=self.name, params={"model": model, "greyscale": greyscale})
         res = await self.project.add_vector_type(vec)
-        await self.load_vector_types()
         return ActionResult(value=res)
 
     def _get_vector_func_notifs(self, vec_type: VectorType):

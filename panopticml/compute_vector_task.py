@@ -19,8 +19,8 @@ class ComputeVectorTask(Task):
     def __init__(self, plugin: PanopticML, vec_type: VectorType, instance: Instance,
                  data_path: str):
         super().__init__()
-        self.plugin: PanopticML = plugin
         self.project = plugin.project
+        self.plugin: PanopticML = plugin
         self.type = vec_type
         self.instance = instance
         self.transformer = self.plugin.transformers.get(vec_type)
@@ -34,13 +34,13 @@ class ComputeVectorTask(Task):
         if exist:
             return
 
-        image_data = await self.project.get_project().db.get_large_image(instance.sha1)
+        image_data = await self._project.db.get_large_image(instance.sha1)
         if not image_data:
             file = instance.url
             async with aiofiles.open(file, mode='rb') as file:
                 image_data = await file.read()
 
-        vector_data = await self._async(self.compute_image_vector, image_data)
+        vector_data = await self.run_async(self.compute_image_vector, image_data)
 
         if vector_data is None:
             return

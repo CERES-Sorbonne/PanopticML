@@ -1,5 +1,4 @@
 from enum import Enum
-
 import torch
 from PIL import Image
 import numpy as np
