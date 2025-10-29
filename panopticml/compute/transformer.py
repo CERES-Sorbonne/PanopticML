@@ -1,3 +1,4 @@
+import asyncio
 from enum import Enum
 import torch
 from PIL import Image
@@ -17,7 +18,6 @@ def get_transformer(huggingface_model=None):
     if model_type in type_to_class_mapping:
         return type_to_class_mapping[model_type](huggingface_model)
     return AutoTransformer(huggingface_model)
-
 
 class Transformer(object):
     def __init__(self, huggingface_model: str):
@@ -147,6 +147,8 @@ type_to_class_mapping = {
 }
 
 
+GET_LOCK = asyncio.Lock()
+
 class TransformerManager:
     def __init__(self):
         self.transformers: dict[int, Transformer] = {}
@@ -156,3 +158,7 @@ class TransformerManager:
             return self.transformers[vec_type.id]
         self.transformers[vec_type.id] = get_transformer(vec_type.params["model"])
         return self.transformers[vec_type.id]
+
+    async def async_get(self, vec_type: VectorType):
+        async with GET_LOCK:
+            return self.get(vec_type)

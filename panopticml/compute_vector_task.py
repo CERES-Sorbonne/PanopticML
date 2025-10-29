@@ -17,16 +17,17 @@ logger = logging.getLogger('PanopticML:VectorTask')
 
 class ComputeVectorTask(Task):
     def __init__(self, plugin: PanopticML, vec_type: VectorType, instance: Instance,
-                 data_path: str):
+                 data_path: str, transformer):
         super().__init__()
         self.project = plugin.project
         self.plugin: PanopticML = plugin
         self.type = vec_type
         self.instance = instance
-        self.transformer = self.plugin.transformers.get(vec_type)
-        self.name = f'{self.transformer.name} Vectors ({vec_type.id})'
+        self.vec_type = vec_type
+        self.name = f'{vec_type.params['model']} Vectors ({vec_type.id})'
         self.data_path = data_path
         self.key += f"vec_id_{vec_type.id}"
+        self.transformer = transformer
 
     async def run(self):
         instance = self.instance
@@ -51,6 +52,7 @@ class ComputeVectorTask(Task):
 
     async def run_if_last(self):
         await self.plugin.trees.rebuild_tree(self.type)
+
 
     def compute_image_vector(self, image_data: bytes):
         image = preprocess_image(image_data, self.type.params)
