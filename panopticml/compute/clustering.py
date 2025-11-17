@@ -1,5 +1,6 @@
 import faiss
 import numpy as np
+from sklearn.cluster import HDBSCAN
 import torch
 
 from panoptic.models import Vector
@@ -24,7 +25,8 @@ def make_clusters(vectors: list[Vector], **kwargs) -> (list[list[str]], list[int
         res_clusters.append(list(sha1_cluster))
     # sort clusters by distances
     sorted_clusters = [cluster for _, cluster in sorted(zip(res_distances, res_clusters))]
-    return sorted_clusters, sorted(res_distances)
+    res_distances_scaled = [i * 100 for i in res_distances]
+    return sorted_clusters, sorted(res_distances_scaled)
 
 
 def _make_clusters_faiss(vectors, nb_clusters=6, **kwargs) -> (np.ndarray, np.ndarray):
@@ -35,7 +37,6 @@ def _make_clusters_faiss(vectors, nb_clusters=6, **kwargs) -> (np.ndarray, np.nd
 
     vectors = np.asarray(vectors)
     if nb_clusters == -1:
-        from sklearn.cluster import HDBSCAN
         clusterer = HDBSCAN(min_cluster_size=5)
         clusterer.fit(vectors)
         indices = clusterer.labels_
@@ -101,6 +102,7 @@ def cluster_by_text(image_vectors: list[Vector], text_vectors: list[np.array], t
         groups.append(group)
 
     return groups
+
 
 def custom_range(min_i, max_i, steps, increments):
     """
