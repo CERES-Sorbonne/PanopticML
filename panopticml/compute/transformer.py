@@ -159,6 +159,9 @@ class TransformerManager:
         self.transformers[vec_type.id] = get_transformer(vec_type.params["model"])
         return self.transformers[vec_type.id]
 
-    async def async_get(self, vec_type: VectorType):
+    async def async_get(self, project, vec_type: VectorType):
         async with GET_LOCK:
-            return self.get(vec_type)
+            if self.transformers.get(vec_type.id):
+                return self.transformers[vec_type.id]
+            self.transformers[vec_type.id] = await project.run_async(get_transformer, vec_type.params["model"])
+            return self.transformers[vec_type.id]

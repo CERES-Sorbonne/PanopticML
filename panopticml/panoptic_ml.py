@@ -74,7 +74,7 @@ class PanopticML(APlugin):
         self.add_action_easy(self.compute_clusters, ['group'])
         self.add_action_easy(self.cluster_by_tags, ['group'])
         self.add_action_easy(self.find_duplicates, ['group'])
-        self.add_action_easy(self.search_by_text, ['execute'])
+        self.add_action_easy(self.search_by_text, ['execute', 'text_search'])
 
         self.trees = FaissTreeManager(self)
         self.transformers = TransformerManager()
@@ -123,7 +123,7 @@ class PanopticML(APlugin):
             await self._compute_image_vector(instance, t)
 
     async def _compute_image_vector(self, instance: Instance, vec_type: VectorType):
-        transformer = await self.transformers.async_get(vec_type)
+        transformer = await self.transformers.async_get(self.project, vec_type)
         task = ComputeVectorTask(self, vec_type, instance, self.data_path, transformer)
         self.project.add_task(task)
 
