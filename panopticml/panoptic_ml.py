@@ -151,7 +151,7 @@ class PanopticML(APlugin):
                                         Compute the vectors and try again.) """,
                                 functions=self._get_vector_func_notifs(vec_type))
             return ActionResult(notifs=[empty_notif])
-        clusters, distances = make_clusters(vectors, method="kmeans", nb_clusters=nb_clusters)
+        clusters, distances = await self.project.run_async(make_clusters, vectors, method="kmeans", nb_clusters=nb_clusters)
         groups = []
         groups_images = []
         labels = []
