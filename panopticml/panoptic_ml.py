@@ -1,4 +1,5 @@
 import os
+from typing import Coroutine
 
 from panoptic.core.project.project import Project
 from .compute.transformers import get_transformer
@@ -312,13 +313,18 @@ class PanopticML(APlugin):
             return None
         # TODO: get tags text from the PropertyId
         pano_vectors = await self.project.get_vectors(type_id=vec_type.id, sha1s=sha1s)
+        tree = await self.trees.get(vec_type)
+        groups = await self.project.run_async(self._compute_duplicate_groups, tree, pano_vectors, min_similarity)
+        return ActionResult(groups=groups)
+
+    @staticmethod
+    def _compute_duplicate_groups(tree, pano_vectors, min_similarity):
         vectors, sha1s = zip(*[(i.data, i.sha1) for i in pano_vectors])
         already_in_clusters = set()
         groups = []
         for vector, sha1 in zip(vectors, sha1s):
             if sha1 in already_in_clusters:
                 continue
-            tree = await self.trees.get(vec_type)
             res = tree.query([vector.data], 150)
             filtered = [r for r in res if r['dist'] >= min_similarity and r['sha1'] in sha1s]
             res_sha1s = [r['sha1'] for r in filtered]
@@ -328,7 +334,7 @@ class PanopticML(APlugin):
                 continue
             already_in_clusters.update(res_sha1s)
             groups.append(Group(sha1s=res_sha1s, scores=score_list))
-        return ActionResult(groups=groups)
+        return groups
 
     async def rebuild_trees(self):
         types = await self.project.get_vector_types(self.name)
