@@ -25,7 +25,7 @@ from pydantic import BaseModel
 
 
 from panoptic.core.plugin.plugin import APlugin
-from panoptic.models import Instance, ActionContext, PropertyId, PropertyType, VectorType, OwnVectorType
+from panoptic.models import Instance, ActionContext, PropertyId, PropertyType, VectorType, OwnVectorType, Vector
 from panoptic.models.results import Group, ActionResult, Notif, NotifType, NotifFunction, ScoreList, Score
 from panoptic.utils import group_by_sha1
 
@@ -36,6 +36,7 @@ from .compute.transformer import TransformerManager, get_transformer
 from .compute.transformers import TransformerName
 from .compute_vector_task import ComputeVectorTask
 from .utils import is_image_url
+from sklearn.manifold import TSNE
 
 
 class PluginParams(BaseModel):
@@ -74,7 +75,8 @@ class PanopticML(APlugin):
         self.add_action_easy(self.compute_clusters, ['group'])
         self.add_action_easy(self.cluster_by_tags, ['group'])
         self.add_action_easy(self.find_duplicates, ['group'])
-        self.add_action_easy(self.search_by_text, ['execute', 'text_search'])
+        self.add_action_easy(self.search_by_text, ['text_search'])
+        self.add_action_easy(self.compute_2d_cloud, ['map'])
 
         self.trees = FaissTreeManager(self)
         self.transformers = TransformerManager()
@@ -256,7 +258,7 @@ class PanopticML(APlugin):
         final_sha1s = res_sha1s[remaped_scores >= min_similarity].tolist()
 
         scores = ScoreList(min=0, max=1, values=final_scores,
-                           description="Similarity between image and text never give less than 0.1 and more than 0.4, hence here the values, remapped between 0 and 1")
+                           description="Similarity between image and text never give less than 0.1 and more than 0.4, hence here the data, remapped between 0 and 1")
         res = Group(sha1s=final_sha1s, scores=scores)
         res.name = "Text Search: " + text
         return ActionResult(groups=[res])
@@ -312,13 +314,18 @@ class PanopticML(APlugin):
             return None
         # TODO: get tags text from the PropertyId
         pano_vectors = await self.project.get_vectors(type_id=vec_type.id, sha1s=sha1s)
+        tree = await self.trees.get(vec_type)
+        groups = await self.project.run_async(self._compute_duplicate_groups, tree, pano_vectors, min_similarity)
+        return ActionResult(groups=groups)
+
+    @staticmethod
+    def _compute_duplicate_groups(tree, pano_vectors, min_similarity):
         vectors, sha1s = zip(*[(i.data, i.sha1) for i in pano_vectors])
         already_in_clusters = set()
         groups = []
         for vector, sha1 in zip(vectors, sha1s):
             if sha1 in already_in_clusters:
                 continue
-            tree = await self.trees.get(vec_type)
             res = tree.query([vector.data], 150)
             filtered = [r for r in res if r['dist'] >= min_similarity and r['sha1'] in sha1s]
             res_sha1s = [r['sha1'] for r in filtered]
@@ -328,7 +335,37 @@ class PanopticML(APlugin):
                 continue
             already_in_clusters.update(res_sha1s)
             groups.append(Group(sha1s=res_sha1s, scores=score_list))
-        return ActionResult(groups=groups)
+        return groups
+
+    async def compute_2d_cloud(self, ctx: ActionContext, vec_type: OwnVectorType):
+        instances = await self.project.get_instances(ctx.instance_ids)
+        sha1s = list({i.sha1 for i in instances})
+        vectors = await self.project.get_vectors(vec_type.id, sha1s=sha1s)
+        points = await self.project.run_async(self.get_umap_coordinates, vectors)
+
+        values = []
+        for sha1 in points.keys():
+            values.append(sha1)
+            values.append(points[sha1][0])
+            values.append(points[sha1][1])
+        point_map = await self.project.create_map(name=vec_type.id, key='sha1', data=values)
+        point_map = await self.project.add_map(point_map)
+
+        return ActionResult(value=point_map)
+
+
+    @staticmethod
+    def get_umap_coordinates(vectors: list[Vector]):
+        data = np.asarray([v.data for v in vectors])
+
+        # Apply t-SNE
+        tsne = TSNE(n_components=2, perplexity=30, random_state=None)
+        tsne_result = tsne.fit_transform(data)
+
+        # Prepare the dictionary
+        result_dict = {vectors[i].sha1: tsne_result[i].tolist() for i in range(tsne_result.shape[0])}
+
+        return result_dict
 
     async def rebuild_trees(self):
         types = await self.project.get_vector_types(self.name)

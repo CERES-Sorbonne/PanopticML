@@ -77,7 +77,7 @@ def cluster_by_text(image_vectors: list[Vector], text_vectors: list[np.array], t
 
         # similarities of each image inside the cluster and the text
         cluster_sim = similarities[closest_text_indices == text_index]
-        sorted_sim = cluster_sim.sort(descending=True).values
+        sorted_sim = cluster_sim.sort(descending=True).data
         cluster_sims.append([round(x, 2) for x in sorted_sim.tolist()])
 
         # sort cluster by descending similarity
@@ -106,11 +106,11 @@ def cluster_by_text(image_vectors: list[Vector], text_vectors: list[np.array], t
 
 def custom_range(min_i, max_i, steps, increments):
     """
-    Generate a range of values from min_i to max_i with a variable increment for each step
+    Generate a range of data from min_i to max_i with a variable increment for each step
     :param min_i: first value
     :param max_i: last value
-    :param steps: values for which increment should change
-    :param increments: increments values
+    :param steps: data for which increment should change
+    :param increments: increments data
     :return:
     """
     i = min_i
