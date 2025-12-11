@@ -1,5 +1,6 @@
+import base64
 import os
-from typing import Coroutine
+from io import BytesIO
 
 from panoptic.core.project.project import Project
 from .compute.transformers import get_transformer
@@ -26,7 +27,7 @@ from pydantic import BaseModel
 
 
 from panoptic.core.plugin.plugin import APlugin
-from panoptic.models import Instance, ActionContext, PropertyId, PropertyType, VectorType, OwnVectorType
+from panoptic.models import Instance, ActionContext, PropertyId, PropertyType, VectorType, OwnVectorType, InputFile
 from panoptic.models.results import Group, ActionResult, Notif, NotifType, NotifFunction, ScoreList, Score
 from panoptic.utils import group_by_sha1
 
@@ -41,6 +42,7 @@ from .utils import is_image_url
 
 class PluginParams(BaseModel):
     compute_on_import: bool = True
+
 
 
 class ModelEnum(Enum):
@@ -71,7 +73,7 @@ class PanopticML(APlugin):
         self.add_action_easy(self.create_default_vector_type, ['vector_type'])
         self.add_action_easy(self.create_custom_vector_type, ['vector_type'])
         self._comp_vec_desc = self.add_action_easy(self.compute_vectors, ['vector'])
-        self.add_action_easy(self.find_images, ['similar'])
+        self.add_action_easy(self.find_images, ['similar', 'execute'])
         self.add_action_easy(self.compute_clusters, ['group'])
         self.add_action_easy(self.cluster_by_tags, ['group'])
         self.add_action_easy(self.find_duplicates, ['group'])
@@ -175,17 +177,23 @@ class PanopticML(APlugin):
 
         return ActionResult(groups=groups)
 
-    async def find_images(self, context: ActionContext, vec_type: VectorType):
+    async def find_images(self, context: ActionContext, vec_type: VectorType, image_file: InputFile = None):
         """
         Find Similar images using Cosine distances.
         dist: 0 -> images are considered highly dissimilar
         dist: 1 -> images are considered identical
         See: https://en.wikipedia.org/wiki/Cosine_similarity for more.
         """
-        instances = await self.project.get_instances(context.instance_ids)
-        sha1s = [i.sha1 for i in instances]
-        ignore_sha1s = set(sha1s)
-        vectors = await self.project.get_vectors(type_id=vec_type.id, sha1s=sha1s)
+        ignore_sha1s = set()
+        if image_file is None:
+            instances = await self.project.get_instances(context.instance_ids)
+            sha1s = [i.sha1 for i in instances]
+            ignore_sha1s = set(sha1s)
+            vectors = await self.project.get_vectors(type_id=vec_type.id, sha1s=sha1s)
+        else:
+            im = Image.open(BytesIO(base64.b64decode(image_file)))
+            transformer = await self.transformers.async_get(self.project, vec_type)
+            vectors = [transformer.to_vector(im)]
 
         if not vectors:
             return ActionResult(notifs=[Notif(
