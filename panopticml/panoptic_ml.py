@@ -3,7 +3,6 @@ import os
 from io import BytesIO
 
 from panoptic.core.project.project import Project
-from .compute.transformers import get_transformer
 
 
 # deactivate searching for online model if internet is off. Could be made better but works okay for now
@@ -34,10 +33,9 @@ from panoptic.utils import group_by_sha1
 from .compute import make_clusters
 from .compute.clustering import cluster_by_text
 from .compute.faiss_tree import FaissTreeManager
-from .compute.transformer import TransformerManager, get_transformer
-from .compute.transformers import TransformerName
+from .compute.transformer import TransformerManager
 from .compute_vector_task import ComputeVectorTask
-from .utils import is_image_url
+from .utils import is_image_url, ClusterByTagsEnum, process_tags
 
 
 class PluginParams(BaseModel):
@@ -259,8 +257,9 @@ class PanopticML(APlugin):
         res_sha1s = np.asarray(list(index.keys()))
         res_scores = np.asarray([index[sha1] for sha1 in res_sha1s])
 
-        # remap score since text to image similary tends to be between 0.1 and 0.4 and filter by similarity
-        remaped_scores = np.around(np.interp(res_scores, [0, 0.375], [0, 1]), decimals=2)
+        # remap score since text to image similary tends to vary from a model to another, for instance CLIP is between 0.0 and 0.4 and filter by similarity
+        max_text_sim = transformer.max_text_sim
+        remaped_scores = np.around(np.interp(res_scores, [0, max_text_sim], [0, 1]), decimals=2)
         final_scores = remaped_scores[remaped_scores >= min_similarity].tolist()
         final_sha1s = res_sha1s[remaped_scores >= min_similarity].tolist()
 
@@ -270,7 +269,8 @@ class PanopticML(APlugin):
         res.name = "Text Search: " + text
         return ActionResult(groups=[res])
 
-    async def cluster_by_tags(self, context: ActionContext, tags: PropertyId, vec_type: VectorType):
+    async def cluster_by_tags(self, context: ActionContext, tags: PropertyId, vec_type: VectorType, min_similarity: float = 0.5,
+                              parent_tags: ClusterByTagsEnum = ClusterByTagsEnum.use, multiple: bool = False):
         """Cluster images using a Tag/MultiTag property to guide the result"""
         props = await self.project.get_properties(ids=[tags])
         tag_prop = props[0]
@@ -288,7 +288,8 @@ class PanopticML(APlugin):
         if not sha1s:
             return None
         # TODO: get tags text from the PropertyId
-        tags_text = [t.value for t in await self.project.get_tags(property_ids=[tags])]
+        tags = await self.project.get_tags(property_ids=[tags])
+        tags_text = process_tags(tags, parent_tags=parent_tags)
         transformer = self.transformers.get(vec_type)
         text_vectors = transformer.get_text_vectors(tags_text)
         pano_vectors = await self.project.get_vectors(type_id=vec_type.id, sha1s=sha1s)
@@ -302,7 +303,8 @@ class PanopticML(APlugin):
                             Compute the vectors and try again.) """,
                 functions=self._get_vector_func_notifs(vec_type))])
 
-        groups = cluster_by_text(pano_vectors, text_vectors, tags_text)
+        max_text_sim = transformer.max_text_sim
+        groups = cluster_by_text(pano_vectors, text_vectors, tags_text, min_similarity, max_text_sim, multiple)
 
         return ActionResult(groups=groups)
 
@@ -348,13 +350,3 @@ class PanopticML(APlugin):
         types = await self.project.get_vector_types(self.name)
         for type_ in types:
             await self.trees.rebuild_tree(type_)
-
-    def _load_transformer(self):
-        if TransformerName[self.params.model] == TransformerName.auto and not self.params.hugging_face_model:
-            return ActionResult(notifs=[Notif(
-                NotifType.ERROR,
-                name="No hugging face model specified",
-                message=f"""
-                      Automodel selected but no hugging face model provided
-                      """)])
-        return get_transformer(TransformerName[self.params.model], self.params.hugging_face_model)

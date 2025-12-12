@@ -60,48 +60,86 @@ def _make_clusters_faiss(vectors, nb_clusters=6, **kwargs) -> (np.ndarray, np.nd
     return indices.flatten(), distances.flatten()
 
 
-def cluster_by_text(image_vectors: list[Vector], text_vectors: list[np.array], text_labels: list[str]) -> list[Group]:
+def cluster_by_text(image_vectors: list[Vector], text_vectors: list[np.array], text_labels: list[str],
+                    min_similarity: float, max_text_sim: float, multiple: bool) -> list[Group]:
     vectors, sha1s = zip(*[(i.data, i.sha1) for i in image_vectors])
     sha1s_array = np.asarray(sha1s)
 
-    similarities, closest_text_indices = similarity_matrix(vectors, text_vectors)
+    if not multiple:
+        similarities, closest_text_indices = similarity_matrix(vectors, text_vectors, multiple=False)
+        similarities = torch.from_numpy(
+            np.around(np.interp(similarities.numpy(), [0, max_text_sim], [0, 1]), decimals=2)
+        )
+        mask = similarities >= min_similarity
+        filtered_similarities = similarities[mask]
+        filtered_sha1s = sha1s_array[mask]
+        filtered_indices = closest_text_indices[mask]
 
-    clusters = []
-    distances = []
-    clusters_text = []
-    cluster_sims = []
+        clusters = []
+        distances = []
+        clusters_text = []
+        cluster_sims = []
 
-    for text_index in closest_text_indices.unique():
-        clusters_text.append(text_labels[text_index])
-        cluster = sha1s_array[closest_text_indices == text_index]
+        for text_index in filtered_indices.unique():
+            clusters_text.append(text_labels[text_index])
+            cluster = filtered_sha1s[filtered_indices == text_index]
 
-        # similarities of each image inside the cluster and the text
-        cluster_sim = similarities[closest_text_indices == text_index]
-        sorted_sim = cluster_sim.sort(descending=True).values
-        cluster_sims.append([round(x, 2) for x in sorted_sim.tolist()])
+            cluster_sim = filtered_similarities[filtered_indices == text_index]
+            sorted_sim = cluster_sim.sort(descending=True).values
+            cluster_sims.append([round(x, 2) for x in sorted_sim.tolist()])
 
-        # sort cluster by descending similarity
-        sorting_index = cluster_sim.argsort(descending=True)
-        sorted_cluster = cluster[sorting_index]
-        if type(sorted_cluster) is not np.ndarray:
-            sorted_cluster = np.array([sorted_cluster])
-        clusters.append(sorted_cluster)
+            sorting_index = cluster_sim.argsort(descending=True)
+            sorted_cluster = cluster[sorting_index]
+            if type(sorted_cluster) is not np.ndarray:
+                sorted_cluster = np.array([sorted_cluster])
+            clusters.append(sorted_cluster)
 
-        # compute mean distance of the images
-        distance = float((1 - torch.mean(cluster_sim)) * 100)
-        distances.append(distance)
+            distance = float((1 - torch.mean(cluster_sim)) * 100)
+            distances.append(distance)
 
-    groups = []
-    for cluster, distance, name, cluster_sim in zip(clusters, distances, clusters_text, cluster_sims):
-        similarities = ScoreList(min=0, max=1, max_is_best=True, values=cluster_sim)
-        group = Group(score=Score(distance, min=0, max=200, max_is_best=False,
-                                  description="Mean distance between the images of this cluster and the queried text"),
-                      scores=similarities)
-        group.sha1s = list(cluster)
-        group.name = f"Cluster {name}"
-        groups.append(group)
+        groups = []
+        for cluster, distance, name, cluster_sim in zip(clusters, distances, clusters_text, cluster_sims):
+            similarities = ScoreList(min=0, max=1, max_is_best=True, values=cluster_sim)
+            group = Group(score=Score(distance, min=0, max=200, max_is_best=False,
+                                      description="Mean distance between the images of this cluster and the queried text"),
+                          scores=similarities)
+            group.sha1s = list(cluster)
+            group.name = f"Cluster {name}"
+            groups.append(group)
 
-    return groups
+        return groups
+
+    else:
+        similarity_matrix_full = similarity_matrix(vectors, text_vectors, multiple=True)
+        similarity_matrix_remapped = torch.from_numpy(
+            np.around(np.interp(similarity_matrix_full.numpy(), [0, max_text_sim], [0, 1]), decimals=2)
+        )
+
+        groups = []
+        for text_idx, text_label in enumerate(text_labels):
+            text_similarities = similarity_matrix_remapped[:, text_idx]
+            mask = text_similarities >= min_similarity
+
+            cluster_sha1s = sha1s_array[mask]
+            cluster_sims = text_similarities[mask]
+
+            if len(cluster_sha1s) > 0:
+                sorted_sim = cluster_sims.sort(descending=True).values
+                sorting_index = cluster_sims.argsort(descending=True)
+                sorted_cluster = np.atleast_1d(cluster_sha1s[sorting_index])
+
+                distance = float((1 - torch.mean(cluster_sims)) * 100)
+
+                similarities = ScoreList(min=0, max=1, max_is_best=True,
+                                         values=[round(x, 2) for x in sorted_sim.tolist()])
+                group = Group(score=Score(distance, min=0, max=200, max_is_best=False,
+                                          description="Mean distance between the images of this cluster and the queried text"),
+                              scores=similarities)
+                group.sha1s = list(sorted_cluster)
+                group.name = f"Cluster {text_label}"
+                groups.append(group)
+
+        return groups
 
 
 def custom_range(min_i, max_i, steps, increments):

@@ -27,12 +27,19 @@ class Transformer(object):
         self.tokenizer = None
         self.processor = None
         self.model = None
-
+        self.can_handle_text = False
         self.name = huggingface_model
 
     @property
-    def can_handle_text(self):
-        return False
+    def max_text_sim(self):
+        if not self.can_handle_text:
+            raise ValueError("Cannot get max text sim for this model since it cannot handle text")
+        return self._max_text_sim
+
+    @max_text_sim.setter
+    def max_text_sim(self, max_text_sim):
+        if max_text_sim < 1:
+            self._max_text_sim = max_text_sim
 
     def to_vector(self, image: Image):
         pass
@@ -56,10 +63,7 @@ class AutoTransformer(Transformer):
         from transformers import AutoModel, AutoProcessor
         self.model = AutoModel.from_pretrained(huggingface_model).to(self.device)
         self.processor = AutoProcessor.from_pretrained(huggingface_model)
-
-    @property
-    def can_handle_text(self):
-        return True
+        self.can_handle_text = True
 
     def to_vector(self, image: Image) -> np.ndarray:
         inputs = self.processor(images=[image], return_tensors="pt")
@@ -85,10 +89,6 @@ class MobileNetTransformer(Transformer):
         self.model = MobileNetV2Model.from_pretrained(huggingface_model)
         self.processor = AutoImageProcessor.from_pretrained(huggingface_model)
 
-    @property
-    def can_handle_text(self):
-        return False
-
     def to_vector(self, image: Image) -> np.ndarray:
         input1 = self.processor(images=image, return_tensors="pt")
         output1 = self.model(**input1)
@@ -100,19 +100,13 @@ class MobileNetTransformer(Transformer):
 class CLIPTransformer(AutoTransformer):
     def __init__(self, huggingface_model):
         super().__init__(huggingface_model)
-
-    @property
-    def can_handle_text(self):
-        return True
+        self.max_text_sim = 0.375
 
 
 class SIGLIPTransformer(AutoTransformer):
     def __init__(self, huggingface_model):
         super().__init__(huggingface_model)
-
-    @property
-    def can_handle_text(self):
-        return True
+        self.max_text_sim = 0.20
 
 
 class Dinov2Transformer(Transformer):
@@ -121,10 +115,7 @@ class Dinov2Transformer(Transformer):
         from transformers import AutoModel, AutoImageProcessor
         self.model = AutoModel.from_pretrained(huggingface_model).to(self.device)
         self.processor = AutoImageProcessor.from_pretrained(huggingface_model, use_fast=True)
-
-    @property
-    def can_handle_text(self):
-        return False
+        self.can_handle_text = False
 
     def to_vector(self, image: Image) -> np.ndarray:
         inputs = self.processor(images=image, return_tensors="pt").to(self.device)
@@ -138,6 +129,7 @@ class Dinov2Transformer(Transformer):
             embedding = embedding / norm
 
         return embedding
+
 
 type_to_class_mapping = {
     "mobilenet_v2": MobileNetTransformer,
