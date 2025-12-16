@@ -51,3 +51,6 @@ dependencies = [
 # This configuration ensures that the 'panopticml' directory is treated as the package.
 # When installed, the package can be imported using 'import panopticml'.
 packages = ["panopticml"]
+
+git [project.scripts]
+panopticml-init = "panopticml.__init__:init_model"
