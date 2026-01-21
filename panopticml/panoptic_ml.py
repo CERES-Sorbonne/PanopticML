@@ -76,7 +76,7 @@ class PanopticML(APlugin):
         self.add_action_easy(self.cluster_by_tags, ['group'])
         self.add_action_easy(self.find_duplicates, ['group'])
         self.add_action_easy(self.search_by_text, ['text_search'])
-        self.add_action_easy(self.compute_2d_cloud, ['map'])
+        self.add_action_easy(self.compute_2d_cloud, ['map', 'execute'])
 
         self.trees = FaissTreeManager(self)
         self.transformers = TransformerManager()
@@ -337,7 +337,7 @@ class PanopticML(APlugin):
             groups.append(Group(sha1s=res_sha1s, scores=score_list))
         return groups
 
-    async def compute_2d_cloud(self, ctx: ActionContext, vec_type: OwnVectorType):
+    async def compute_2d_cloud(self, ctx: ActionContext, vec_type: OwnVectorType, map_name: str = ""):
         instances = await self.project.get_instances(ctx.instance_ids)
         sha1s = list({i.sha1 for i in instances})
         vectors = await self.project.get_vectors(vec_type.id, sha1s=sha1s)
@@ -348,7 +348,10 @@ class PanopticML(APlugin):
             values.append(sha1)
             values.append(points[sha1][0])
             values.append(points[sha1][1])
-        point_map = await self.project.create_map(name=vec_type.id, key='sha1', data=values)
+
+        if map_name == "":
+            map_name = f"{vec_type.params["model"]}"
+        point_map = await self.project.create_map(name=map_name, key='sha1', data=values)
         point_map = await self.project.add_map(point_map)
 
         return ActionResult(value=point_map)
