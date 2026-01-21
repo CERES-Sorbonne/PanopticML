@@ -1,5 +1,6 @@
 import base64
 import os
+import pickle
 from io import BytesIO
 
 from panoptic.core.project.project import Project
@@ -79,6 +80,8 @@ class PanopticML(APlugin):
 
         self.trees = FaissTreeManager(self)
         self.transformers = TransformerManager()
+        # use to store text_vectors computed in differents functions
+        self.text_vectors = {}
 
     async def start(self):
         await super().start()
@@ -274,7 +277,8 @@ class PanopticML(APlugin):
         """Cluster images using a Tag/MultiTag property to guide the result"""
         props = await self.project.get_properties(ids=[tags])
         tag_prop = props[0]
-
+        # prefix = "cette image est en afrique et représente "
+        prefix = ""
         if tag_prop.type != PropertyType.tag and tag_prop.type != PropertyType.multi_tags:
             notif = Notif(type=NotifType.ERROR,
                           name="WrongPropertyType",
@@ -290,8 +294,22 @@ class PanopticML(APlugin):
         # TODO: get tags text from the PropertyId
         tags = await self.project.get_tags(property_ids=[tags])
         tags_text = process_tags(tags, parent_tags=parent_tags)
-        transformer = self.transformers.get(vec_type)
-        text_vectors = transformer.get_text_vectors(tags_text)
+        if prefix:
+            tags_text = [prefix + text for text in tags_text]
+        texts_to_transform = []
+        text_vectors = []
+        transformer = None
+        self._load_text_vectors()
+        for text in tags_text:
+            if text in self.text_vectors:
+                text_vectors.append(self.text_vectors[text])
+            else:
+                texts_to_transform.append(text)
+        if len(texts_to_transform) > 0:
+            transformer = await self.transformers.async_get(self.project, vec_type)
+            transformed_texts = transformer.get_text_vectors(texts_to_transform)
+            text_vectors = [*transformed_texts, *text_vectors]
+            self._save_text_vectors(texts_to_transform, transformed_texts)
         pano_vectors = await self.project.get_vectors(type_id=vec_type.id, sha1s=sha1s)
 
         if not pano_vectors:
@@ -303,7 +321,7 @@ class PanopticML(APlugin):
                             Compute the vectors and try again.) """,
                 functions=self._get_vector_func_notifs(vec_type))])
 
-        max_text_sim = transformer.max_text_sim
+        max_text_sim = transformer.max_text_sim if transformer else 0.2
         groups = cluster_by_text(pano_vectors, text_vectors, tags_text, min_similarity, max_text_sim, multiple)
 
         return ActionResult(groups=groups)
@@ -350,3 +368,21 @@ class PanopticML(APlugin):
         types = await self.project.get_vector_types(self.name)
         for type_ in types:
             await self.trees.rebuild_tree(type_)
+
+
+
+    def _save_text_vectors(self, texts, text_vectors: list[VectorType]):
+        for text, text_vector in zip(texts, text_vectors):
+            self.text_vectors[text] = text_vector
+        with open(self.data_path / 'text_vectors.pkl', 'wb') as f:
+            pickle.dump(self.text_vectors, f)
+
+
+    def _load_text_vectors(self):
+        path = self.data_path / 'text_vectors.pkl'
+        if path.exists():
+            with open(path, 'rb') as f:
+                self.text_vectors = pickle.load(f)
+
+
+

@@ -3,7 +3,7 @@ from enum import Enum
 import torch
 from PIL import Image
 import numpy as np
-from transformers import AutoConfig
+from transformers import AutoConfig, BitsAndBytesConfig
 
 from panoptic.models import VectorType
 from ..utils import resolve_device
@@ -60,18 +60,28 @@ class Transformer(object):
 class AutoTransformer(Transformer):
     def __init__(self, huggingface_model):
         super().__init__(huggingface_model)
+        self.device = 'cpu'
         from transformers import AutoModel, AutoProcessor
-        self.model = AutoModel.from_pretrained(huggingface_model).to(self.device)
+
+        # Chargement en float16 sans quantification
+        self.model = AutoModel.from_pretrained(
+            huggingface_model,
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True
+        ).to(self.device)
+
         self.processor = AutoProcessor.from_pretrained(huggingface_model)
         self.can_handle_text = True
+        self.max_text_sim = 0.20
 
     def to_vector(self, image: Image) -> np.ndarray:
         inputs = self.processor(images=[image], return_tensors="pt")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
         with torch.no_grad():
             image_features = self.model.get_image_features(**inputs)
             image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        return image_features.cpu().numpy().flatten()
+            return image_features.cpu().float().numpy().flatten()
 
     def to_text_vector(self, text: str) -> np.ndarray:
         inputs = self.processor(text=[text], return_tensors="pt")
@@ -79,8 +89,7 @@ class AutoTransformer(Transformer):
         with torch.no_grad():
             text_features = self.model.get_text_features(**inputs)
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-        return text_features.cpu().numpy().flatten()
-
+        return text_features.cpu().float().numpy().flatten()
 
 class MobileNetTransformer(Transformer):
     def __init__(self, huggingface_model: str):
@@ -135,6 +144,7 @@ type_to_class_mapping = {
     "mobilenet_v2": MobileNetTransformer,
     "dinov2": Dinov2Transformer,
     "siglip2": SIGLIPTransformer,
+    "siglip": SIGLIPTransformer,
     "clip": CLIPTransformer
 }
 

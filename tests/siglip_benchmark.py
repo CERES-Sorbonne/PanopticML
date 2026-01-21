@@ -41,27 +41,54 @@ class AutoTransformer(Transformer):
         inputs = self.processor(images=[image], return_tensors="pt")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         with torch.no_grad():
-            image_features = self.model.get_image_features(**inputs)
-            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        return image_features.cpu().numpy().flatten()
+            vision_outputs = self.model.vision_model(**inputs)
+            image_embeds = vision_outputs[1]  # pooled output
+
+            # Applique la projection si elle existe
+            if hasattr(self.model, 'visual_projection'):
+                image_embeds = self.model.visual_projection(image_embeds)
+
+            image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
+        return image_embeds.cpu().numpy().flatten()
 
     def to_text_vector(self, text: str) -> np.ndarray:
-        inputs = self.processor(text=[text], return_tensors="pt")
+        inputs = self.processor(text=[text], return_tensors="pt", padding="max_length", truncation=True)
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         with torch.no_grad():
-            text_features = self.model.get_text_features(**inputs)
-            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-        return text_features.cpu().numpy().flatten()
+            text_outputs = self.model.text_model(**inputs)
+            text_embeds = text_outputs[1]  # pooled output
+
+            # Applique la projection si elle existe
+            if hasattr(self.model, 'text_projection'):
+                text_embeds = self.model.text_projection(text_embeds)
+
+            text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
+        return text_embeds.cpu().numpy().flatten()
 
 class SIGLIPTransformer(AutoTransformer):
-    def __init__(self):
-        model_name = "openai/clip-vit-base-patch32"
+    def __init__(self, model_name):
+        model_name = model_name
+
         super().__init__(model_name)
         self.name = "SIGLIP"
 
     @property
     def can_handle_text(self):
         return True
+
+    def to_text_vector_siglip_large(self, text: str) -> np.ndarray:
+        # Pour les modèles non-naflex, force le forward complet
+        # Crée une image dummy minimale
+        dummy_img = Image.new('RGB', (16, 16))  # Plus petit possible
+
+        inputs = self.processor(text=[text], images=[dummy_img], return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+            text_embeds = outputs.text_embeds
+            text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
+        return text_embeds.cpu().numpy().flatten()
 
 
 def get_images(folder, nb=None):
@@ -107,8 +134,65 @@ def generate_vectors_batch(transformer: Transformer, images=None, batch_size=16)
 
     return vectors, image_paths
 
-if __name__ == "__main__":
-    folder = r"D:\CorpusImage\documerica\extracted_images"
+def text_image_sim():
+    folder = r"./resources"
     siglip = SIGLIPTransformer()
+    images = get_images(Path(folder))
+    pil_images = [Image.open(i).convert('RGB') for i in images]
+    vectors = [siglip.to_vector(i) for i in pil_images]
+    texts = ["a cat", "a dog", "a spider"]
+    text_vectors = [siglip.to_text_vector_siglip_large(t) for t in texts]
+    sim_match = np.dot(vectors[1], text_vectors[0])
+    sim_nomatch = np.dot(vectors[1], text_vectors[1])
+    print(f"Similarité image-texte correspondant: {sim_match}")
+    print(f"Similarité image-texte non-correspondant: {sim_nomatch}")
+    print(f"Match > NoMatch ? {sim_match > sim_nomatch}")
+
+def test_debug():
+    models_to_test = [
+        "google/siglip2-large-patch16-512",  # Celui qui pose problème
+        "google/siglip-large-patch16-384",  # Version SigLIP v1
+        "google/siglip2-so400m-patch14-384",
+        "google/siglip2-so400m-patch16-naflex",
+        "google/siglip2-giant-opt-patch16-384"
+    ]
+    for model_name in models_to_test:
+        siglip = SIGLIPTransformer(model_name)
+        print(f"===== USING MODEL {model_name} =====")
+        image1 = Image.open("./resources/chat.png").convert('RGB')
+        image2 = Image.open("./resources/cropped_chat.png").convert('RGB') # Un autre chat
+        image3 = Image.open("./resources/spider.jpg").convert('RGB') # Quelque chose de différent
+
+        img1_vec = siglip.to_vector(image1)
+        img2_vec = siglip.to_vector(image2)
+        img3_vec = siglip.to_vector(image3)
+
+        print("=== SIMILARITÉ IMAGE-IMAGE ===")
+        print(f"Chat1 vs Chat2: {np.dot(img1_vec, img2_vec)}")
+        print(f"Chat1 vs araignée: {np.dot(img1_vec, img3_vec)}")
+
+        # Test 2 : Similarité TEXTE-TEXTE
+        text1 = "a photo of a cat"
+        text2 = "a picture of a feline"
+        text3 = "a spider looking at the camera"
+
+        txt1_vec = siglip.to_text_vector(text1)
+        txt2_vec = siglip.to_text_vector(text2)
+        txt3_vec = siglip.to_text_vector(text3)
+
+        print("\n=== SIMILARITÉ TEXTE-TEXTE ===")
+        print(f"Cat vs Feline: {np.dot(txt1_vec, txt2_vec)}")
+        print(f"Cat vs Spider: {np.dot(txt1_vec, txt3_vec)}")
+
+        # Test 3 : TEXTE-IMAGE (on sait que c'est cassé)
+        print("\n=== SIMILARITÉ TEXTE-IMAGE ===")
+        print(f"Text 'cat' vs Image chat: {np.dot(txt1_vec, img1_vec)}")
+        print(f"Text 'cat' vs Image spider: {np.dot(txt1_vec, img3_vec)}")
+        print(f"Text 'spider' vs Image spider: {np.dot(txt3_vec, img3_vec)}")
+        print(f"Text 'spider' vs Image chat: {np.dot(txt3_vec, img1_vec)}")
+
+if __name__ == "__main__":
     # vectors, images = generate_vectors(siglip, get_images(Path(folder), 200))
-    vectors, images = generate_vectors_batch(siglip, get_images(Path(folder), 200), 16)
+    # vectors, images = generate_vectors_batch(siglip, get_images(Path(folder), 200), 16)
+    # text_image_sim()
+    test_debug()
