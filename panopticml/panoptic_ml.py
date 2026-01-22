@@ -1,5 +1,6 @@
 import os
 
+import pacmap
 import umap
 
 from panoptic.core.project.project import Project
@@ -343,7 +344,7 @@ class PanopticML(APlugin):
         instances = await self.project.get_instances(ctx.instance_ids)
         sha1s = list({i.sha1 for i in instances})
         vectors = await self.project.get_vectors(vec_type.id, sha1s=sha1s)
-        points = await self.project.run_async(self.get_umap_coordinates, vectors)
+        points = await self.project.run_async(self.get_pacmap_coordinates, vectors)
 
         values = []
         for sha1 in points.keys():
@@ -357,6 +358,14 @@ class PanopticML(APlugin):
         point_map = await self.project.add_map(point_map)
 
         return ActionResult(value=point_map)
+
+    @staticmethod
+    def get_pacmap_coordinates(vectors: list[Vector]):
+        data = np.asarray([v.data for v in vectors])
+        embedding = pacmap.PaCMAP(n_components=2, n_neighbors=10, MN_ratio=0.5, FP_ratio=2.0)
+        pacmap_result = embedding.fit_transform(data, init="pca")
+        result_dict = {vectors[i].sha1: pacmap_result[i].tolist() for i in range(pacmap_result.shape[0])}
+        return result_dict
 
     @staticmethod
     def get_tsne_coordinates(vectors: list[Vector]):
