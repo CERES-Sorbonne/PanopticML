@@ -1,5 +1,7 @@
 import os
 
+import umap
+
 from panoptic.core.project.project import Project
 from .compute.transformers import get_transformer
 
@@ -290,7 +292,7 @@ class PanopticML(APlugin):
             return ActionResult(notifs=[Notif(
                 NotifType.ERROR,
                 name="NoData",
-                message=f"""The Cluster_By_Tags function needs image vectors.
+                message=f"""The Cluster_By_Tags function needs images vectors.
                             No such vectors ({vec_type.value}) could be found. 
                             Compute the vectors and try again.) """,
                 functions=self._get_vector_func_notifs(vec_type))])
@@ -350,15 +352,14 @@ class PanopticML(APlugin):
             values.append(points[sha1][1])
 
         if map_name == "":
-            map_name = f"{vec_type.params["model"]}"
+            map_name = f"{vec_type.params['model']}"
         point_map = await self.project.create_map(name=map_name, key='sha1', data=values)
         point_map = await self.project.add_map(point_map)
 
         return ActionResult(value=point_map)
 
-
     @staticmethod
-    def get_umap_coordinates(vectors: list[Vector]):
+    def get_tsne_coordinates(vectors: list[Vector]):
         data = np.asarray([v.data for v in vectors])
 
         # Apply t-SNE
@@ -370,10 +371,25 @@ class PanopticML(APlugin):
 
         return result_dict
 
+    @staticmethod
+    def get_umap_coordinates(vectors: list[Vector]):
+        """
+        Applique UMAP pour réduire les vecteurs en 2D et retourne un dictionnaire {sha1: coordonnées}
+        """
+        data = np.asarray([v.data for v in vectors])
+
+        umap_reducer = umap.UMAP(n_components=2, random_state=None)
+        umap_result = umap_reducer.fit_transform(data)
+
+        result_dict = {vectors[i].sha1: umap_result[i].tolist() for i in range(umap_result.shape[0])}
+
+        return result_dict
+
     async def rebuild_trees(self):
         types = await self.project.get_vector_types(self.name)
         for type_ in types:
             await self.trees.rebuild_tree(type_)
+
 
     def _load_transformer(self):
         if TransformerName[self.params.model] == TransformerName.auto and not self.params.hugging_face_model:
