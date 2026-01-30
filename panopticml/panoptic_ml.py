@@ -38,7 +38,7 @@ from .compute.faiss_tree import FaissTreeManager
 from .compute.transformer import TransformerManager, get_transformer
 from .compute.transformers import TransformerName
 from .compute_vector_task import ComputeVectorTask
-from .utils import is_image_url
+from .utils import is_image_url, normalize_positions
 from sklearn.manifold import TSNE
 
 
@@ -79,7 +79,9 @@ class PanopticML(APlugin):
         self.add_action_easy(self.cluster_by_tags, ['group'])
         self.add_action_easy(self.find_duplicates, ['group'])
         self.add_action_easy(self.search_by_text, ['text_search'])
-        self.add_action_easy(self.compute_2d_cloud, ['map', 'execute'])
+        self.add_action_easy(self.pacmap, ['map', 'execute'])
+        self.add_action_easy(self.umap, ['map', 'execute'])
+        self.add_action_easy(self.tsne, ['map', 'execute'])
 
         self.trees = FaissTreeManager(self)
         self.transformers = TransformerManager()
@@ -92,6 +94,14 @@ class PanopticML(APlugin):
         if len(self.vector_types) == 0:
             await self.project.add_vector_type(VectorType(id=-1, source=self.name,
                                                           params={"model": ModelEnum.clip.value, "greyscale": False}))
+
+        # maps = await self.project.list_maps()
+        # for map_ in maps:
+        #     full_map = await self.project.get_map(map_.id)
+        #     normalized_data = normalize_positions(full_map.data, 100)
+        #     new_map = await self.project.create_map(map_.name, map_.key, normalized_data)
+        #     await self.project.add_map(new_map)
+        #     await self.project.delete_map(map_.id)
 
     async def create_default_vector_type(self, ctx: ActionContext, model: ModelEnum, greyscale: bool):
         vec = VectorType(id=-1, source=self.name, params={"model": model.value, "greyscale": greyscale})
@@ -340,7 +350,7 @@ class PanopticML(APlugin):
             groups.append(Group(sha1s=res_sha1s, scores=score_list))
         return groups
 
-    async def compute_2d_cloud(self, ctx: ActionContext, vec_type: OwnVectorType, map_name: str = ""):
+    async def pacmap(self, ctx: ActionContext, vec_type: OwnVectorType, map_name: str = ""):
         instances = await self.project.get_instances(ctx.instance_ids)
         sha1s = list({i.sha1 for i in instances})
         vectors = await self.project.get_vectors(vec_type.id, sha1s=sha1s)
@@ -353,8 +363,49 @@ class PanopticML(APlugin):
             values.append(points[sha1][1])
 
         if map_name == "":
-            map_name = f"{vec_type.params['model']}"
+            map_name = f"pacmap: {vec_type.params['model']}"
         point_map = await self.project.create_map(name=map_name, key='sha1', data=values)
+        point_map.data = normalize_positions(point_map.data, 100)
+        point_map = await self.project.add_map(point_map)
+
+        return ActionResult(value=point_map)
+
+    async def tsne(self, ctx: ActionContext, vec_type: OwnVectorType, map_name: str = ""):
+        instances = await self.project.get_instances(ctx.instance_ids)
+        sha1s = list({i.sha1 for i in instances})
+        vectors = await self.project.get_vectors(vec_type.id, sha1s=sha1s)
+        points = await self.project.run_async(self.get_tsne_coordinates, vectors)
+
+        values = []
+        for sha1 in points.keys():
+            values.append(sha1)
+            values.append(points[sha1][0])
+            values.append(points[sha1][1])
+
+        if map_name == "":
+            map_name = f"tsne: {vec_type.params['model']}"
+        point_map = await self.project.create_map(name=map_name, key='sha1', data=values)
+        point_map.data = normalize_positions(point_map.data, 100)
+        point_map = await self.project.add_map(point_map)
+
+        return ActionResult(value=point_map)
+
+    async def umap(self, ctx: ActionContext, vec_type: OwnVectorType, map_name: str = ""):
+        instances = await self.project.get_instances(ctx.instance_ids)
+        sha1s = list({i.sha1 for i in instances})
+        vectors = await self.project.get_vectors(vec_type.id, sha1s=sha1s)
+        points = await self.project.run_async(self.get_umap_coordinates, vectors)
+
+        values = []
+        for sha1 in points.keys():
+            values.append(sha1)
+            values.append(points[sha1][0])
+            values.append(points[sha1][1])
+
+        if map_name == "":
+            map_name = f"umap: {vec_type.params['model']}"
+        point_map = await self.project.create_map(name=map_name, key='sha1', data=values)
+        point_map.data = normalize_positions(point_map.data, 100)
         point_map = await self.project.add_map(point_map)
 
         return ActionResult(value=point_map)
