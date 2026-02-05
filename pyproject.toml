@@ -35,7 +35,7 @@ dependencies = [
     "torch", #; platform_system != 'Darwin'",
     "faiss-cpu<1.11.0",
     "scipy",
-    "scikit-learn", # ; platform_system != 'Darwin'",
+    "fast_hdbscan", # ; platform_system != 'Darwin'",
     "numpy", #; platform_system != 'Darwin'",
     "transformers<4.52.0",
     "mistralai",
