@@ -35,11 +35,13 @@ dependencies = [
     "torch", #; platform_system != 'Darwin'",
     "faiss-cpu<1.11.0",
     "scipy",
-    "fast_hdbscan", # ; platform_system != 'Darwin'",
+    "fast_hdbscan",
+    "umap-learn",
     "numpy", #; platform_system != 'Darwin'",
     "transformers<4.52.0",
     "mistralai",
     "torchvision",
+    "pacmap"
 ]
 
 

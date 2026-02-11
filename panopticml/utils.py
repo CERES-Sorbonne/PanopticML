@@ -1,6 +1,8 @@
 import io
 from enum import Enum
 
+import math
+
 import numpy as np
 import torch
 import re
@@ -177,3 +179,44 @@ def build_tag_hierarchy(tags):
         }
 
     return hierarchy
+
+def normalize_positions(data, max_dist):
+    """
+    Normalize positions so that the maximum distance from origin doesn't exceed max_dist.
+
+    Args:
+        data: List containing [key1, x1, y1, key2, x2, y2, ...]
+        max_dist: Maximum allowed distance from origin
+
+    Returns:
+        List in same format with normalized positions
+    """
+    # Parse the array into key-position pairs
+    points = []
+    for i in range(0, len(data), 3):
+        points.append({
+            'key': data[i],
+            'x': data[i + 1],
+            'y': data[i + 2]
+        })
+
+    # Find the maximum distance from origin
+    current_max_dist = 0
+    for point in points:
+        dist = math.sqrt(point['x'] ** 2 + point['y'] ** 2)
+        if dist > current_max_dist:
+            current_max_dist = dist
+
+    # Calculate scaling factor
+    scale_factor = max_dist / current_max_dist
+
+    # Scale all positions and rebuild the array
+    result = []
+    for point in points:
+        result.extend([
+            point['key'],
+            point['x'] * scale_factor,
+            point['y'] * scale_factor
+        ])
+
+    return result
