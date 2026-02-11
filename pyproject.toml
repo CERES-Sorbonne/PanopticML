@@ -36,10 +36,12 @@ dependencies = [
     "faiss-cpu<1.11.0",
     "scipy",
     "scikit-learn", # ; platform_system != 'Darwin'",
+    "umap-learn",
     "numpy", #; platform_system != 'Darwin'",
     "transformers<4.52.0",
     "mistralai",
     "torchvision",
+    "pacmap"
 ]
 
 

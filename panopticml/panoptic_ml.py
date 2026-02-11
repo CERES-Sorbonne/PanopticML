@@ -2,6 +2,9 @@ import base64
 import os
 from io import BytesIO
 
+import pacmap
+import umap
+
 from panoptic.core.project.project import Project
 
 
@@ -26,6 +29,7 @@ from pydantic import BaseModel
 
 
 from panoptic.core.plugin.plugin import APlugin
+from panoptic.models import Instance, ActionContext, PropertyId, PropertyType, VectorType, OwnVectorType, Vector
 from panoptic.models import Instance, ActionContext, PropertyId, PropertyType, VectorType, OwnVectorType, InputFile
 from panoptic.models.results import Group, ActionResult, Notif, NotifType, NotifFunction, ScoreList, Score
 from panoptic.utils import group_by_sha1
@@ -33,8 +37,10 @@ from panoptic.utils import group_by_sha1
 from .compute import make_clusters
 from .compute.clustering import cluster_by_text
 from .compute.faiss_tree import FaissTreeManager
-from .compute.transformer import TransformerManager
+from .compute.transformer import TransformerManager, get_transformer
 from .compute_vector_task import ComputeVectorTask
+from .utils import is_image_url, normalize_positions
+from sklearn.manifold import TSNE
 from .utils import is_image_url, ClusterByTagsEnum, process_tags
 
 
@@ -75,7 +81,10 @@ class PanopticML(APlugin):
         self.add_action_easy(self.compute_clusters, ['group'])
         self.add_action_easy(self.cluster_by_tags, ['group'])
         self.add_action_easy(self.find_duplicates, ['group'])
-        self.add_action_easy(self.search_by_text, ['execute', 'text_search'])
+        self.add_action_easy(self.search_by_text, ['text_search'])
+        self.add_action_easy(self.pacmap, ['map', 'execute'])
+        self.add_action_easy(self.umap, ['map', 'execute'])
+        self.add_action_easy(self.tsne, ['map', 'execute'])
 
         self.trees = FaissTreeManager(self)
         self.transformers = TransformerManager()
@@ -88,6 +97,14 @@ class PanopticML(APlugin):
         if len(self.vector_types) == 0:
             await self.project.add_vector_type(VectorType(id=-1, source=self.name,
                                                           params={"model": ModelEnum.clip.value, "greyscale": False}))
+
+        # maps = await self.project.list_maps()
+        # for map_ in maps:
+        #     full_map = await self.project.get_map(map_.id)
+        #     normalized_data = normalize_positions(full_map.data, 100)
+        #     new_map = await self.project.create_map(map_.name, map_.key, normalized_data)
+        #     await self.project.add_map(new_map)
+        #     await self.project.delete_map(map_.id)
 
     async def create_default_vector_type(self, ctx: ActionContext, model: ModelEnum, greyscale: bool):
         vec = VectorType(id=-1, source=self.name, params={"model": model.value, "greyscale": greyscale})
@@ -298,7 +315,7 @@ class PanopticML(APlugin):
             return ActionResult(notifs=[Notif(
                 NotifType.ERROR,
                 name="NoData",
-                message=f"""The Cluster_By_Tags function needs image vectors.
+                message=f"""The Cluster_By_Tags function needs images vectors.
                             No such vectors ({vec_type.value}) could be found. 
                             Compute the vectors and try again.) """,
                 functions=self._get_vector_func_notifs(vec_type))])
@@ -345,6 +362,102 @@ class PanopticML(APlugin):
             already_in_clusters.update(res_sha1s)
             groups.append(Group(sha1s=res_sha1s, scores=score_list))
         return groups
+        return groups
+
+    async def pacmap(self, ctx: ActionContext, vec_type: OwnVectorType, map_name: str = ""):
+        instances = await self.project.get_instances(ctx.instance_ids)
+        sha1s = list({i.sha1 for i in instances})
+        vectors = await self.project.get_vectors(vec_type.id, sha1s=sha1s)
+        points = await self.project.run_async(self.get_pacmap_coordinates, vectors)
+
+        values = []
+        for sha1 in points.keys():
+            values.append(sha1)
+            values.append(points[sha1][0])
+            values.append(points[sha1][1])
+
+        if map_name == "":
+            map_name = f"pacmap: {vec_type.params['model']}"
+        point_map = await self.project.create_map(name=map_name, key='sha1', data=values)
+        point_map.data = normalize_positions(point_map.data, 100)
+        point_map = await self.project.add_map(point_map)
+
+        return ActionResult(value=point_map)
+
+    async def tsne(self, ctx: ActionContext, vec_type: OwnVectorType, map_name: str = ""):
+        instances = await self.project.get_instances(ctx.instance_ids)
+        sha1s = list({i.sha1 for i in instances})
+        vectors = await self.project.get_vectors(vec_type.id, sha1s=sha1s)
+        points = await self.project.run_async(self.get_tsne_coordinates, vectors)
+
+        values = []
+        for sha1 in points.keys():
+            values.append(sha1)
+            values.append(points[sha1][0])
+            values.append(points[sha1][1])
+
+        if map_name == "":
+            map_name = f"tsne: {vec_type.params['model']}"
+        point_map = await self.project.create_map(name=map_name, key='sha1', data=values)
+        point_map.data = normalize_positions(point_map.data, 100)
+        point_map = await self.project.add_map(point_map)
+
+        return ActionResult(value=point_map)
+
+    async def umap(self, ctx: ActionContext, vec_type: OwnVectorType, map_name: str = ""):
+        instances = await self.project.get_instances(ctx.instance_ids)
+        sha1s = list({i.sha1 for i in instances})
+        vectors = await self.project.get_vectors(vec_type.id, sha1s=sha1s)
+        points = await self.project.run_async(self.get_umap_coordinates, vectors)
+
+        values = []
+        for sha1 in points.keys():
+            values.append(sha1)
+            values.append(points[sha1][0])
+            values.append(points[sha1][1])
+
+        if map_name == "":
+            map_name = f"umap: {vec_type.params['model']}"
+        point_map = await self.project.create_map(name=map_name, key='sha1', data=values)
+        point_map.data = normalize_positions(point_map.data, 100)
+        point_map = await self.project.add_map(point_map)
+
+        return ActionResult(value=point_map)
+
+    @staticmethod
+    def get_pacmap_coordinates(vectors: list[Vector]):
+        data = np.asarray([v.data for v in vectors])
+        embedding = pacmap.PaCMAP(n_components=2, n_neighbors=10, MN_ratio=0.5, FP_ratio=2.0)
+        pacmap_result = embedding.fit_transform(data, init="pca")
+        result_dict = {vectors[i].sha1: pacmap_result[i].tolist() for i in range(pacmap_result.shape[0])}
+        return result_dict
+
+    @staticmethod
+    def get_tsne_coordinates(vectors: list[Vector]):
+        data = np.asarray([v.data for v in vectors])
+
+        # Apply t-SNE
+        tsne = TSNE(n_components=2, perplexity=30, random_state=None)
+        tsne_result = tsne.fit_transform(data)
+
+        # Prepare the dictionary
+        result_dict = {vectors[i].sha1: tsne_result[i].tolist() for i in range(tsne_result.shape[0])}
+
+        return result_dict
+
+    @staticmethod
+    def get_umap_coordinates(vectors: list[Vector]):
+        """
+        Applique UMAP pour réduire les vecteurs en 2D et retourne un dictionnaire {sha1: coordonnées}
+        """
+        data = np.asarray([v.data for v in vectors])
+
+        umap_reducer = umap.UMAP(n_components=2, random_state=None)
+        umap_result = umap_reducer.fit_transform(data)
+
+        result_dict = {vectors[i].sha1: umap_result[i].tolist() for i in range(umap_result.shape[0])}
+
+        return result_dict
 
     async def rebuild_trees(self):
         types = await self.project.get_vector_types(self.name)

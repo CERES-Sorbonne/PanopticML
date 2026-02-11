@@ -10,3 +10,5 @@ transformers
 mistralai
 hdbscan
 torchvision
+umap-learn
+pacmap
