@@ -12,6 +12,11 @@ from ..utils import resolve_device
 def get_model_type(huggingface_model: str):
     return AutoConfig.from_pretrained(huggingface_model).model_type
 
+def extract_model_type(vec_type: VectorType):
+    full_name = vec_type.params['model']
+    full_model = full_name.split('/')[-1]
+    model = full_model.split('-')[0]
+    return model
 
 def get_transformer(huggingface_model=None):
     model_type = get_model_type(huggingface_model)
@@ -58,6 +63,8 @@ class Transformer(object):
 
 
 class AutoTransformer(Transformer):
+    max_text_sim = 0.20
+
     def __init__(self, huggingface_model):
         super().__init__(huggingface_model)
         self.device = 'cpu'
@@ -72,7 +79,6 @@ class AutoTransformer(Transformer):
 
         self.processor = AutoProcessor.from_pretrained(huggingface_model)
         self.can_handle_text = True
-        self.max_text_sim = 0.20
 
     def to_vector(self, image: Image) -> np.ndarray:
         inputs = self.processor(images=[image], return_tensors="pt")
@@ -107,15 +113,18 @@ class MobileNetTransformer(Transformer):
 
 
 class CLIPTransformer(AutoTransformer):
+    max_test_sim = 0.375
+
     def __init__(self, huggingface_model):
         super().__init__(huggingface_model)
-        self.max_text_sim = 0.375
+
 
 
 class SIGLIPTransformer(AutoTransformer):
+    max_text_sim = 0.20
+
     def __init__(self, huggingface_model):
         super().__init__(huggingface_model)
-        self.max_text_sim = 0.20
 
 
 class Dinov2Transformer(Transformer):

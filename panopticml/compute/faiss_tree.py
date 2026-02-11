@@ -31,9 +31,12 @@ class FaissTree:
         return [{'sha1': self.labels[i], 'dist': float('%.2f' % (distances[index]))} for index, i in
                 enumerate(indices)]
 
-    def query_texts(self, texts: list[str], transformer: Transformer):
+    def query_texts(self, texts: list[str], transformer: Transformer, return_vec=False):
         text_vectors = transformer.get_text_vectors(texts)
-        return self.query(text_vectors)
+        images = self.query(text_vectors)
+        if return_vec:
+            return images, text_vectors
+        return images
 
 
 def gen_tree_file_name(type_id: int):

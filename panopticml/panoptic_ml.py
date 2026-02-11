@@ -2,6 +2,7 @@ import base64
 import os
 import pickle
 from io import BytesIO
+from typing import DefaultDict
 
 from panoptic.core.project.project import Project
 
@@ -34,13 +35,14 @@ from panoptic.utils import group_by_sha1
 from .compute import make_clusters
 from .compute.clustering import cluster_by_text
 from .compute.faiss_tree import FaissTreeManager
-from .compute.transformer import TransformerManager
+from .compute.transformer import TransformerManager, type_to_class_mapping, extract_model_type
 from .compute_vector_task import ComputeVectorTask
 from .utils import is_image_url, ClusterByTagsEnum, process_tags
 
 
 class PluginParams(BaseModel):
     compute_on_import: bool = True
+    save_text_searches: bool = False
 
 
 
@@ -81,7 +83,7 @@ class PanopticML(APlugin):
         self.trees = FaissTreeManager(self)
         self.transformers = TransformerManager()
         # use to store text_vectors computed in differents functions
-        self.text_vectors = {}
+        self.text_vectors = DefaultDict(dict)
 
     async def start(self):
         await super().start()
@@ -241,16 +243,21 @@ class PanopticML(APlugin):
                           message=f"No Faiss tree could be loaded for vec_type {vec_type.value}")
             return ActionResult(notifs=[notif])
 
-        transformer = self.transformers.get(vec_type)
-        try:
-            if is_image_url(text):
-                im = Image.open(requests.get(text, stream=True).raw)
-                vec = transformer.to_vector(im)
-                resulting_images = tree.query([vec])
-            else:
-                resulting_images = tree.query_texts([text], self.transformers.get(vec_type))
-        except ValueError as e:
-            return ActionResult(notifs=[Notif(type=NotifType.ERROR, name="TextSimilarityError", message=str(e))])
+        self._load_text_vectors(vec_type)
+        text_vectors = []
+        if text in self.text_vectors[vec_type]:
+            resulting_images = tree.query([self.text_vectors[vec_type][text]])
+        else:
+            transformer = await self.transformers.async_get(self.project, vec_type)
+            try:
+                if is_image_url(text):
+                    im = Image.open(requests.get(text, stream=True).raw)
+                    vec = transformer.to_vector(im)
+                    resulting_images = tree.query([vec])
+                else:
+                    resulting_images, text_vectors = tree.query_texts([text], self.transformers.get(vec_type), return_vec=True)
+            except ValueError as e:
+                return ActionResult(notifs=[Notif(type=NotifType.ERROR, name="TextSimilarityError", message=str(e))])
 
 
         # filter out images if they are not in the current context
@@ -261,7 +268,7 @@ class PanopticML(APlugin):
         res_scores = np.asarray([index[sha1] for sha1 in res_sha1s])
 
         # remap score since text to image similary tends to vary from a model to another, for instance CLIP is between 0.0 and 0.4 and filter by similarity
-        max_text_sim = transformer.max_text_sim
+        max_text_sim = type_to_class_mapping[extract_model_type(vec_type)].max_text_sim
         remaped_scores = np.around(np.interp(res_scores, [0, max_text_sim], [0, 1]), decimals=2)
         final_scores = remaped_scores[remaped_scores >= min_similarity].tolist()
         final_sha1s = res_sha1s[remaped_scores >= min_similarity].tolist()
@@ -270,15 +277,15 @@ class PanopticML(APlugin):
                            description="Similarity between image and text never give less than 0.1 and more than 0.4, hence here the values, remapped between 0 and 1")
         res = Group(sha1s=final_sha1s, scores=scores)
         res.name = "Text Search: " + text
+        if self.params.save_text_searches and len(text_vectors) > 0:
+            self._save_text_vectors([text], text_vectors, vec_type)
         return ActionResult(groups=[res])
 
     async def cluster_by_tags(self, context: ActionContext, tags: PropertyId, vec_type: VectorType, min_similarity: float = 0.5,
-                              parent_tags: ClusterByTagsEnum = ClusterByTagsEnum.use, multiple: bool = False):
+                              parent_tags: ClusterByTagsEnum = ClusterByTagsEnum.use, multiple: bool = False, prefix: str = '',):
         """Cluster images using a Tag/MultiTag property to guide the result"""
         props = await self.project.get_properties(ids=[tags])
         tag_prop = props[0]
-        # prefix = "cette image est en afrique et représente "
-        prefix = ""
         if tag_prop.type != PropertyType.tag and tag_prop.type != PropertyType.multi_tags:
             notif = Notif(type=NotifType.ERROR,
                           name="WrongPropertyType",
@@ -299,7 +306,7 @@ class PanopticML(APlugin):
         texts_to_transform = []
         text_vectors = []
         transformer = None
-        self._load_text_vectors()
+        self._load_text_vectors(vec_type)
         for text in tags_text:
             if text in self.text_vectors:
                 text_vectors.append(self.text_vectors[text])
@@ -309,7 +316,7 @@ class PanopticML(APlugin):
             transformer = await self.transformers.async_get(self.project, vec_type)
             transformed_texts = transformer.get_text_vectors(texts_to_transform)
             text_vectors = [*transformed_texts, *text_vectors]
-            self._save_text_vectors(texts_to_transform, transformed_texts)
+            self._save_text_vectors(texts_to_transform, transformed_texts, vec_type)
         pano_vectors = await self.project.get_vectors(type_id=vec_type.id, sha1s=sha1s)
 
         if not pano_vectors:
@@ -371,18 +378,20 @@ class PanopticML(APlugin):
 
 
 
-    def _save_text_vectors(self, texts, text_vectors: list[VectorType]):
+    def _save_text_vectors(self, texts, text_vectors: list[VectorType], vec_type: VectorType):
         for text, text_vector in zip(texts, text_vectors):
-            self.text_vectors[text] = text_vector
-        with open(self.data_path / 'text_vectors.pkl', 'wb') as f:
-            pickle.dump(self.text_vectors, f)
+            self.text_vectors[vec_type][text] = text_vector
+        with open(self.data_path / (str(vec_type) + '_text_vectors.pkl'), 'wb') as f:
+            pickle.dump(self.text_vectors[vec_type], f)
 
 
-    def _load_text_vectors(self):
-        path = self.data_path / 'text_vectors.pkl'
+    def _load_text_vectors(self, vec_type: VectorType):
+        if self.text_vectors[vec_type]:
+            return
+        path = self.data_path / (str(vec_type) + '_text_vectors.pkl')
         if path.exists():
             with open(path, 'rb') as f:
-                self.text_vectors = pickle.load(f)
+                self.text_vectors[vec_type] = pickle.load(f)
 
 
 
