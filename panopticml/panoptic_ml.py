@@ -28,22 +28,20 @@ import numpy as np
 import requests
 from PIL import Image
 from pydantic import BaseModel
+from sklearn.manifold import TSNE
 
 
 from panoptic.core.plugin.plugin import APlugin
-from panoptic.models import Instance, ActionContext, PropertyId, PropertyType, VectorType, OwnVectorType, Vector
-from panoptic.models import Instance, ActionContext, PropertyId, PropertyType, VectorType, OwnVectorType, InputFile
+from panoptic.models import Instance, ActionContext, PropertyId, PropertyType, VectorType, OwnVectorType, InputFile, Vector
 from panoptic.models.results import Group, ActionResult, Notif, NotifType, NotifFunction, ScoreList, Score
 from panoptic.utils import group_by_sha1
 
 from .compute import make_clusters
 from .compute.clustering import cluster_by_text
 from .compute.faiss_tree import FaissTreeManager
-from .compute.transformer import TransformerManager, get_transformer, type_to_class_mapping, extract_model_type
+from .compute.transformer import TransformerManager, type_to_class_mapping, extract_model_type
 from .compute_vector_task import ComputeVectorTask
-from .utils import is_image_url, normalize_positions
-from sklearn.manifold import TSNE
-from .utils import is_image_url, ClusterByTagsEnum, process_tags
+from .utils import is_image_url, ClusterByTagsEnum, process_tags, normalize_positions
 
 
 class PluginParams(BaseModel):
