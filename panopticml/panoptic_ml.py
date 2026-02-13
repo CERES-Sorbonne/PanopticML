@@ -195,6 +195,7 @@ class PanopticML(APlugin):
         See: https://en.wikipedia.org/wiki/Cosine_similarity for more.
         """
         ignore_sha1s = set()
+        print(image_file)
         if image_file is None:
             instances = await self.project.get_instances(context.instance_ids)
             sha1s = [i.sha1 for i in instances]
@@ -202,6 +203,8 @@ class PanopticML(APlugin):
             vectors = await self.project.get_vectors(type_id=vec_type.id, sha1s=sha1s)
         else:
             im = Image.open(BytesIO(base64.b64decode(image_file)))
+            if im.mode in ("RGBA", "P"):
+                im = im.convert("RGB")
             transformer = await self.transformers.async_get(self.project, vec_type)
             vectors = [transformer.to_vector(im)]
 
