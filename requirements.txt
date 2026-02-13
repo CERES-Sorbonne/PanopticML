@@ -12,3 +12,4 @@ hdbscan
 torchvision
 umap-learn
 pacmap
+fast_hdbscan
