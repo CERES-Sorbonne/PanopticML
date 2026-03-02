@@ -16,13 +16,19 @@ def extract_model_type(vec_type: VectorType):
     full_name = vec_type.params['model']
     full_model = full_name.split('/')[-1]
     model = full_model.split('-')[0]
-    return model
+    return model.lower()
 
 def get_transformer(huggingface_model=None):
     model_type = get_model_type(huggingface_model)
     if model_type in type_to_class_mapping:
         return type_to_class_mapping[model_type](huggingface_model)
-    return AutoTransformer(huggingface_model)
+    try:
+        model = AutoTransformer(huggingface_model)
+        return model
+    except torch.OutOfMemoryError:
+        for model in type_to_class_mapping:
+            del type_to_class_mapping[model]
+        return AutoTransformer(huggingface_model)
 
 class Transformer(object):
     def __init__(self, huggingface_model: str):
