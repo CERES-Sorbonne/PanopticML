@@ -67,7 +67,6 @@ class AutoTransformer(Transformer):
 
     def __init__(self, huggingface_model):
         super().__init__(huggingface_model)
-        self.device = 'cpu'
         from transformers import AutoModel, AutoProcessor
 
         # Chargement en float16 sans quantification
