@@ -42,7 +42,8 @@ dependencies = [
     "transformers<4.52.0",
     "mistralai",
     "torchvision",
-    "pacmap"
+    "pacmap",
+    "accelerate"
 ]
 
 

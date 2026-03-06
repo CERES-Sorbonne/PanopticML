@@ -13,3 +13,4 @@ torchvision
 umap-learn
 pacmap
 fast_hdbscan
+accelerate

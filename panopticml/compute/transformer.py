@@ -74,11 +74,13 @@ class AutoTransformer(Transformer):
     def __init__(self, huggingface_model):
         super().__init__(huggingface_model)
         from transformers import AutoModel, AutoProcessor
-
+        torch_type = torch.float32
+        if torch.cuda.is_available():
+            torch_type = torch.float16
         # Chargement en float16 sans quantification
         self.model = AutoModel.from_pretrained(
             huggingface_model,
-            torch_dtype=torch.float16,
+            torch_dtype=torch_type,
             low_cpu_mem_usage=True
         ).to(self.device)
 
