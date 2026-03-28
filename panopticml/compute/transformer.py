@@ -67,13 +67,13 @@ class AutoTransformer(Transformer):
 
     def __init__(self, huggingface_model):
         super().__init__(huggingface_model)
-        self.device = 'cpu'
         from transformers import AutoModel, AutoProcessor
 
-        # Chargement en float16 sans quantification
+        # 1. Load in float16 directly to the device
+        # Using float16 on M4 Pro is significantly faster and more memory efficient
         self.model = AutoModel.from_pretrained(
             huggingface_model,
-            torch_dtype=torch.float16,
+            torch_dtype=torch.float16,  # Change from float32
             low_cpu_mem_usage=True
         ).to(self.device)
 
@@ -81,21 +81,34 @@ class AutoTransformer(Transformer):
         self.can_handle_text = True
 
     def to_vector(self, image: Image) -> np.ndarray:
+        # 2. Preprocessing happens on CPU (returns float32 by default)
         inputs = self.processor(images=[image], return_tensors="pt")
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        # 3. Move to MPS and EXPLICITLY cast to float16 to match model weights
+        inputs = {k: v.to(self.device).to(torch.float16) for k, v in inputs.items()}
 
         with torch.no_grad():
+            # Ensure the forward pass is wrapped in an autocast or just rely on the manual cast above
             image_features = self.model.get_image_features(**inputs)
+
+            # 4. Normalization is more stable in float32 for high precision
             image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-            return image_features.cpu().float().numpy().flatten()
+
+            # Move back to CPU and cast to float for numpy compatibility
+            return image_features.cpu().to(torch.float32).numpy().flatten()
 
     def to_text_vector(self, text: str) -> np.ndarray:
         inputs = self.processor(text=[text], return_tensors="pt")
+
+        # NOTE: CLIP Tokenizers return Integers (input_ids), which CANNOT be float16.
+        # We only cast the tensors that are floating point.
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
         with torch.no_grad():
             text_features = self.model.get_text_features(**inputs)
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-        return text_features.cpu().float().numpy().flatten()
+
+        return text_features.cpu().to(torch.float32).numpy().flatten()
 
 class MobileNetTransformer(Transformer):
     def __init__(self, huggingface_model: str):

@@ -77,11 +77,12 @@ def similarity_matrix(vectors1: list[np.array], vectors2: list[np.array], multip
 
 def resolve_device():
     device = 'cpu'
+    print(torch.backends.mps.is_available())
     if torch.cuda.is_available():
         device = 'cuda'
     # TODO: when silicon bugs are working again put it back
-    # elif torch.backends.mps.is_available():
-    #     device = 'mps'
+    elif torch.backends.mps.is_available():
+        device = 'mps'
     return device
 
 def is_image_url(url):
