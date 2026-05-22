@@ -4,8 +4,8 @@ from fast_hdbscan import HDBSCAN
 # from sklearn.cluster import HDBSCAN
 import torch
 
-from panoptic.models import Vector
-from panoptic.models.results import ScoreList, Score, Group
+from panoptic.core.databases.media.models import Vector
+from panoptic2.models.action_models import ScoreList, Score, Group
 from ..utils import similarity_matrix
 
 

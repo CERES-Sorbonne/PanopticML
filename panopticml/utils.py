@@ -8,7 +8,7 @@ import torch
 import re
 from PIL import Image
 
-from panoptic.models import Tag
+from panoptic.models.data import Tag
 
 
 def preprocess_image(image_data: bytes, params: dict):
@@ -75,15 +75,17 @@ def similarity_matrix(vectors1: list[np.array], vectors2: list[np.array], multip
         #
         # return scores_list, indices_list
 
-def resolve_device():
-    device = 'cpu'
-    print(torch.backends.mps.is_available())
+def resolve_device() -> str:
+    import logging
+    logger = logging.getLogger('PanopticML')
     if torch.cuda.is_available():
-        device = 'cuda'
-    # TODO: when silicon bugs are working again put it back
-    elif torch.backends.mps.is_available():
-        device = 'mps'
-    return device
+        logger.info("PanopticML: using CUDA")
+        return 'cuda'
+    if torch.backends.mps.is_available():
+        logger.info("PanopticML: using MPS (Apple Silicon)")
+        return 'mps'
+    logger.info("PanopticML: using CPU")
+    return 'cpu'
 
 def is_image_url(url):
     pattern = re.compile(
