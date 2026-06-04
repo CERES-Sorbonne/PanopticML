@@ -10,9 +10,9 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .panoptic_ml import PanopticML
 
-from panoptic2.core.task.task import Task
+from panoptic.core.task.task import Task
 from panoptic.core.databases.media.models import Vector, VectorType
-from panoptic.models.data import Instance
+from panoptic.models.models import Instance
 
 logger = logging.getLogger('PanopticML')
 

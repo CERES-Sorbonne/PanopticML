@@ -29,13 +29,13 @@ from PIL import Image
 from pydantic import BaseModel
 from sklearn.manifold import TSNE
 
-from panoptic2.core.plugin.plugin import APlugin
-from panoptic2.models.action_models import (
+from panoptic.core.plugin.plugin import APlugin
+from panoptic.models.action_models import (
     ActionContext, ActionResult, Group, InputFile, Notif, NotifType,
     OwnVectorType, PropertyId, Score, ScoreList,
 )
 from panoptic.core.databases.media.models import Map, Vector, VectorType
-from panoptic.models.data import Instance
+from panoptic.models.models import Instance
 
 from .compute import make_clusters
 from .compute.clustering import cluster_by_text
@@ -88,7 +88,8 @@ class PanopticML(APlugin):
         self.add_action_easy(self.create_default_vector_type, ['vector_type'])
         self.add_action_easy(self.create_custom_vector_type, ['vector_type'])
         self.add_action_easy(self.compute_vectors, ['vector'])
-        self.add_action_easy(self.find_images, ['similar', 'execute'])
+        self.add_action_easy(self.find_images, ['similar'])
+        self.add_action_easy(self.find_images_from_file, ['execute'])
         self.add_action_easy(self.compute_clusters, ['group'])
         self.add_action_easy(self.cluster_by_tags, ['group'])
         self.add_action_easy(self.find_duplicates, ['group'])
@@ -117,7 +118,7 @@ class PanopticML(APlugin):
     # Vector type creation
     # ------------------------------------------------------------------
 
-    def create_default_vector_type(self, ctx: ActionContext, model: ModelEnum, greyscale: bool) -> ActionResult:
+    def create_default_vector_type(self, ctx: ActionContext, model: ModelEnum = ModelEnum.clip, greyscale: bool = False) -> ActionResult:
         """Create a vector type using a predefined model.
         @model: the embedding model to use
         @greyscale: convert images to greyscale before embedding
@@ -126,7 +127,7 @@ class PanopticML(APlugin):
         res = self.project.upsert_vector_type(vt)
         return ActionResult(value=res)
 
-    def create_custom_vector_type(self, ctx: ActionContext, model: str, greyscale: bool) -> ActionResult:
+    def create_custom_vector_type(self, ctx: ActionContext, model: str = '', greyscale: bool = False) -> ActionResult:
         """Create a vector type using a custom HuggingFace model name.
         @model: HuggingFace model identifier (e.g. openai/clip-vit-base-patch32)
         @greyscale: convert images to greyscale before embedding
@@ -249,7 +250,10 @@ class PanopticML(APlugin):
     # Similarity search
     # ------------------------------------------------------------------
 
-    def find_images(self, context: ActionContext, vec_type: OwnVectorType,
+    def find_images(self, context: ActionContext, vec_type: OwnVectorType) -> ActionResult:
+        return self.find_images_from_file(context, vec_type, image_file=None)
+
+    def find_images_from_file(self, context: ActionContext, vec_type: OwnVectorType,
                     image_file: InputFile = None) -> ActionResult:
         """Find similar images using cosine similarity.
         @vec_type: vector space to search in
@@ -505,6 +509,6 @@ class PanopticML(APlugin):
     # ------------------------------------------------------------------
 
     def _get_instances(self, context: ActionContext) -> list:
-        if context.instance_ids:
+        if context.instance_ids is not None:
             return self.project.get_instances(id=context.instance_ids)
         return self.project.get_instances()

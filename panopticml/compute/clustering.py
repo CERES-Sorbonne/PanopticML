@@ -5,7 +5,7 @@ from fast_hdbscan import HDBSCAN
 import torch
 
 from panoptic.core.databases.media.models import Vector
-from panoptic2.models.action_models import ScoreList, Score, Group
+from panoptic.models.action_models import ScoreList, Score, Group
 from ..utils import similarity_matrix
 
 
