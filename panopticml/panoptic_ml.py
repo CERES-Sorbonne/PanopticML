@@ -81,8 +81,8 @@ class PanopticML(APlugin):
     """
 
     def __init__(self, name: str, project, plugin_path: str):
-        self.params = PluginParams()
         super().__init__(name=name, project=project, plugin_path=plugin_path)
+        self.params = PluginParams()
         self.project.on_instance_import(self._on_import)
         self.project.on_folder_delete(self._on_folder_delete)
         self.add_action_easy(self.create_default_vector_type, ['vector_type'])
