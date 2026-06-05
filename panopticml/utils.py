@@ -211,6 +211,8 @@ def normalize_positions(data, max_dist):
             current_max_dist = dist
 
     # Calculate scaling factor
+    if current_max_dist == 0:
+        return data
     scale_factor = max_dist / current_max_dist
 
     # Scale all positions and rebuild the array

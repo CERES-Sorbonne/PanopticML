@@ -250,14 +250,17 @@ class PanopticML(APlugin):
     # Similarity search
     # ------------------------------------------------------------------
 
-    def find_images(self, context: ActionContext, vec_type: OwnVectorType) -> ActionResult:
-        return self.find_images_from_file(context, vec_type, image_file=None)
+    def find_images(self, context: ActionContext, vec_type: OwnVectorType,
+                    max_results: int = 200) -> ActionResult:
+        return self.find_images_from_file(context, vec_type, image_file=None,
+                                          max_results=max_results)
 
     def find_images_from_file(self, context: ActionContext, vec_type: OwnVectorType,
-                    image_file: InputFile = None) -> ActionResult:
+                    image_file: InputFile = None, max_results: int = 200) -> ActionResult:
         """Find similar images using cosine similarity.
         @vec_type: vector space to search in
         @image_file: optional uploaded image to search by (defaults to selected images)
+        @max_results: maximum number of similar images to return (top-k neighbours)
         """
         ignore_sha1s: set = set()
 
@@ -288,8 +291,14 @@ class PanopticML(APlugin):
                 message=f"No Faiss tree for {vector_name(vec_type)}",
             )])
 
-        res = tree.query(vector_datas)
+        # cap the number of neighbours: querying the full tree (k defaults to
+        # 999999) returns every image in the dataset, which overwhelms the
+        # frontend on large collections (e.g. 500k instances).
+        # ask for a few extra to compensate for ignored (queried) sha1s.
+        k = max(1, max_results) + len(ignore_sha1s)
+        res = tree.query(vector_datas, k=k)
         index = {r['sha1']: r['dist'] for r in res if r['sha1'] not in ignore_sha1s}
+        index = dict(list(index.items())[:max(1, max_results)])
         res_sha1s = list(index.keys())
         scores = ScoreList(min=0, max=1, values=[index[s] for s in res_sha1s],
                            max_is_best=True, description="Cosine similarity (1 = identical)")
@@ -431,6 +440,10 @@ class PanopticML(APlugin):
         instances = self._get_instances(ctx)
         sha1s = list({i.sha1 for i in instances})
         vectors = self.project.get_vectors(vec_type.id, sha1s=sha1s)
+        print(len(vectors))
+        if len(vectors) < 2:
+            return ActionResult(notifs=[Notif(NotifType.ERROR, name="NoData",
+                message=f"Need at least 2 vectors to compute a map (got {len(vectors)}).")])
         points = self.project.run_in_executor(self._get_pacmap_coordinates, vectors)
         return self._save_map(points, vec_type, map_name or f"pacmap: {vec_type.params['model']}")
 
@@ -442,6 +455,9 @@ class PanopticML(APlugin):
         instances = self._get_instances(ctx)
         sha1s = list({i.sha1 for i in instances})
         vectors = self.project.get_vectors(vec_type.id, sha1s=sha1s)
+        if len(vectors) < 2:
+            return ActionResult(notifs=[Notif(NotifType.ERROR, name="NoData",
+                message=f"Need at least 2 vectors to compute a map (got {len(vectors)}).")])
         points = self.project.run_in_executor(self._get_tsne_coordinates, vectors)
         return self._save_map(points, vec_type, map_name or f"tsne: {vec_type.params['model']}")
 
@@ -453,6 +469,9 @@ class PanopticML(APlugin):
         instances = self._get_instances(ctx)
         sha1s = list({i.sha1 for i in instances})
         vectors = self.project.get_vectors(vec_type.id, sha1s=sha1s)
+        if len(vectors) < 2:
+            return ActionResult(notifs=[Notif(NotifType.ERROR, name="NoData",
+                message=f"Need at least 2 vectors to compute a map (got {len(vectors)}).")])
         points = self.project.run_in_executor(self._get_umap_coordinates, vectors)
         return self._save_map(points, vec_type, map_name or f"umap: {vec_type.params['model']}")
 
@@ -469,6 +488,8 @@ class PanopticML(APlugin):
 
     @staticmethod
     def _get_pacmap_coordinates(vectors: list[Vector]) -> dict:
+        if len(vectors) < 2:
+            return {}
         data = np.asarray([v.data for v in vectors])
         embedding = pacmap.PaCMAP(n_components=2, n_neighbors=10, MN_ratio=0.5, FP_ratio=2.0)
         result = embedding.fit_transform(data, init="pca")
@@ -476,12 +497,16 @@ class PanopticML(APlugin):
 
     @staticmethod
     def _get_tsne_coordinates(vectors: list[Vector]) -> dict:
+        if len(vectors) < 2:
+            return {}
         data = np.asarray([v.data for v in vectors])
         result = TSNE(n_components=2, perplexity=30, random_state=None).fit_transform(data)
         return {vectors[i].sha1: result[i].tolist() for i in range(result.shape[0])}
 
     @staticmethod
     def _get_umap_coordinates(vectors: list[Vector]) -> dict:
+        if len(vectors) < 2:
+            return {}
         data = np.asarray([v.data for v in vectors])
         result = umap.UMAP(n_components=2, random_state=None).fit_transform(data)
         return {vectors[i].sha1: result[i].tolist() for i in range(result.shape[0])}
@@ -509,6 +534,6 @@ class PanopticML(APlugin):
     # ------------------------------------------------------------------
 
     def _get_instances(self, context: ActionContext) -> list:
-        if context.instance_ids is not None:
+        if context.instance_ids:
             return self.project.get_instances(id=context.instance_ids)
         return self.project.get_instances()

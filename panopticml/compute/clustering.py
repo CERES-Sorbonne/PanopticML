@@ -10,29 +10,44 @@ from ..utils import similarity_matrix
 
 
 def make_clusters(vectors: list[Vector], **kwargs) -> (list[list[str]], list[int]):
-    res_clusters = []
-    res_distances = []
-    vectors, sha1 = zip(*[(i.data, i.sha1) for i in vectors])
+    data, sha1 = zip(*[(i.data, i.sha1) for i in vectors])
     sha1 = np.asarray(sha1)
-    clusters: np.ndarray
+    # single contiguous float32 copy (faiss-ready) instead of tuple -> asarray later
+    vecs = np.ascontiguousarray(data, dtype=np.float32)
 
-    clusters, distances = _make_clusters_faiss(vectors, **kwargs)
+    clusters, distances = _make_clusters_faiss(vecs, **kwargs)
+    clusters = clusters.astype(np.int64, copy=False)
 
-    for cluster in list(set(clusters)):
-        sha1_cluster = sha1[clusters == cluster]
-        current_cluster_distances = distances[clusters == cluster]
-        if distances is not None:
-            res_distances.append(np.mean(current_cluster_distances))
-        res_clusters.append(list(sha1_cluster))
-    # sort clusters by distances
-    sorted_clusters = [cluster for _, cluster in sorted(zip(res_distances, res_clusters))]
-    res_distances_scaled = [i * 100 for i in res_distances]
-    return sorted_clusters, sorted(res_distances_scaled)
+    # Bucket points by cluster label in a single O(N log N) pass instead of one
+    # O(N) boolean mask per cluster (the old loop was O(N * K), which blows up on
+    # the HDBSCAN path where K can be in the thousands for large datasets).
+    order = np.argsort(clusters, kind="stable")
+    sorted_labels = clusters[order]
+    sorted_sha1 = sha1[order]
+    sorted_dist = distances[order]
+
+    starts = np.concatenate(([0], np.flatnonzero(np.diff(sorted_labels)) + 1))
+    ends = np.concatenate((starts[1:], [sorted_labels.size]))
+
+    # per-cluster mean distance, vectorized
+    means = np.add.reduceat(sorted_dist, starts) / (ends - starts)
+
+    # sort clusters by mean distance, keeping clusters and distances aligned
+    by_distance = np.argsort(means, kind="stable")
+    sorted_clusters = [list(sorted_sha1[starts[i]:ends[i]]) for i in by_distance]
+    sorted_distances_scaled = (means[by_distance] * 100).tolist()
+    return sorted_clusters, sorted_distances_scaled
 
 
 def _make_clusters_faiss(vectors, nb_clusters=6, **kwargs) -> (np.ndarray, np.ndarray):
     def _make_single_kmean(vectors, nb_clusters):
-        kmean = faiss.Kmeans(vectors.shape[1], nb_clusters, niter=20, verbose=False)
+        # use the GPU when faiss is built with GPU support (CUDA); stays False
+        # on CPU-only / MPS installs so this never breaks those environments.
+        try:
+            use_gpu = faiss.get_num_gpus() > 0
+        except Exception:
+            use_gpu = False
+        kmean = faiss.Kmeans(vectors.shape[1], nb_clusters, niter=20, verbose=False, gpu=use_gpu)
         kmean.train(vectors)
         return kmean.index.search(vectors, 1)
 
