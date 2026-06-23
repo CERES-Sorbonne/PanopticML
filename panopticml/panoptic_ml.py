@@ -54,7 +54,9 @@ class ModelEnum(Enum):
     clip = "openai/clip-vit-base-patch32"
     mobilenet = "google/mobilenet_v2_1.0_224"
     siglip = "google/siglip2-so400m-patch16-naflex"
-    dinov = "facebook/dinov2-base"
+    dinov2 = "facebook/dinov2-base"
+    dinov3 = "phunghuy159/dinov3"
+    radio = "nvidia/C-RADIOv4-H"
 
 
 def vector_name(vec_type: VectorType):

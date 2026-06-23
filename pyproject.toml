@@ -46,6 +46,12 @@ dependencies = [
     "accelerate"
 ]
 
+[project.optional-dependencies]
+cradio = [
+    "timm",
+    "einops",
+    "open-clip-torch"
+]
 
 [project.urls]
 "Homepage" = "https://github.com/CERES-Sorbonne/PanopticML"
