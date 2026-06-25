@@ -7,7 +7,7 @@ import pytest
 import numpy as np
 
 from panopticml.compute.faiss_tree import FaissTree
-from panopticml.compute.transformers import get_transformer, Transformer
+from panopticml.compute.transformer import get_transformer, Transformer
 from panopticml.panoptic_ml import ModelEnum
 from panopticml.utils import preprocess_image, cosine_similarity
 
@@ -34,7 +34,7 @@ def generate_vectors(transformer: Transformer, images=None):
     images = get_images() if not images else images
     for img_path in images:
         with open(img_path, mode='rb') as f:
-            image_data = preprocess_image(f.read())
+            image_data = preprocess_image(f.read(), {'greyscale': False})
         vectors.append(transformer.to_vector(image_data))
     return vectors, images
 
@@ -86,6 +86,63 @@ def test_text_to_vector(model_name, all_models):
         print(f"✓ Texte converti en vecteur de taille: {text_vector.shape}")
     else:
         print("✗ Ce transformer ne supporte pas la conversion de texte")
+
+
+@pytest.fixture(scope='module')
+def mobileclip_transformer():
+    """Load only the MobileCLIP transformer (avoids preloading every model)."""
+    return get_transformer(ModelEnum.mobileclip_s2.value)
+
+
+def test_mobileclip_vectors_are_meaningful(mobileclip_transformer):
+    """
+    Sanity check targeting the 'clusters make no sense' symptom: MobileCLIP image
+    vectors must be L2-normalized, of consistent dimension, NOT collapsed (distinct
+    images must not be near-identical), and discriminative enough that a cropped cat
+    retrieves the cat.
+    """
+    transformer = mobileclip_transformer
+    image_vectors, images = generate_vectors(transformer)
+
+    dims = {v.shape for v in image_vectors}
+    assert len(dims) == 1, f"Inconsistent vector dimensions across images: {dims}"
+
+    for v, img in zip(image_vectors, images):
+        norm = float(np.linalg.norm(v))
+        assert np.isclose(norm, 1.0, atol=1e-3), f"Vector for {img.name} not L2-normalized (norm={norm:.4f})"
+
+    # If embeddings are collapsed, every pair is ~identical and clustering is garbage.
+    sims = []
+    for i in range(len(image_vectors)):
+        for j in range(i + 1, len(image_vectors)):
+            sims.append(float(cosine_similarity(image_vectors[i], image_vectors[j])))
+    print("MobileCLIP pairwise image cosine sims:", [round(s, 3) for s in sims])
+    assert max(sims) < 0.99, f"Distinct images are near-identical (collapsed embeddings): max sim={max(sims):.4f}"
+
+    # Image-image retrieval: a cropped cat must match the full cat image.
+    tree = create_faiss_tree(image_vectors, images)
+    test_image = pathlib.Path(__file__).parent / 'resources' / 'cropped_chat.png'
+    test_vectors, _ = generate_vectors(transformer, [test_image])
+    best_result = os.path.basename(tree.query([test_vectors[0]])[0]['sha1'])
+    assert best_result == "chat.png", f"cropped_chat should retrieve chat.png, got {best_result}"
+
+
+def test_mobileclip_text_image_similarity(mobileclip_transformer):
+    """MobileCLIP text->image retrieval must point each prompt at the right image."""
+    transformer = mobileclip_transformer
+    assert transformer.can_handle_text
+    texts = ['A jumping spider', 'A bird', 'A happy dog', 'A small grey cat']
+    expected = ['spider.jpg', 'bird.gif', 'dog.jpg', 'chat.png']
+    image_vectors, images = generate_vectors(transformer)
+
+    for text, expected_image in zip(texts, expected):
+        text_vector = transformer.to_text_vector(text)
+        sims = sorted(
+            ((float(cosine_similarity(text_vector, iv)), img.name) for iv, img in zip(image_vectors, images)),
+            reverse=True,
+        )
+        print(f"\nText '{text}' -> {sims[:3]}")
+        assert sims[0][1] == expected_image, f"'{text}': expected {expected_image}, got {sims[0][1]}"
 
 
 @pytest.mark.parametrize("model_name", transformers_to_test)

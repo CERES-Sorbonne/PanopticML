@@ -30,6 +30,11 @@ def extract_model_type(vec_type: VectorType):
     return model.lower()
 
 def get_transformer(huggingface_model=None):
+    # Apple MobileCLIP / MobileCLIP2 repos ship a raw `.pt` checkpoint and a
+    # non-transformers config, so AutoConfig cannot detect a model_type. Route
+    # them by name before attempting any AutoConfig lookup.
+    if "mobileclip" in (huggingface_model or "").lower():
+        return MobileClipTransformer(huggingface_model)
     model_type = get_model_type(huggingface_model)
     if model_type in type_to_class_mapping:
         return type_to_class_mapping[model_type](huggingface_model)
@@ -293,6 +298,76 @@ class RadioTransformer(Transformer):
         return embedding
 
 
+class MobileClipTransformer(Transformer):
+    """
+    Apple MobileCLIP / MobileCLIP2 vision-language models, loaded through open_clip.
+    See: https://huggingface.co/apple/MobileCLIP2-S0 and
+         https://huggingface.co/apple/MobileCLIP-S1
+    """
+    max_text_sim = 0.375
+
+    # open_clip pretrained tags per MobileCLIP architecture.
+    _PRETRAINED_TAGS = {
+        "MobileCLIP2-S0": "dfndr2b",
+        "MobileCLIP2-S2": "dfndr2b",
+        "MobileCLIP2-S3": "dfndr2b",
+        "MobileCLIP2-S4": "dfndr2b",
+        "MobileCLIP2-B": "dfndr2b",
+        "MobileCLIP2-L-14": "dfndr2b",
+        "MobileCLIP-S1": "datacompdr",
+        "MobileCLIP-S2": "datacompdr",
+        "MobileCLIP-B": "datacompdr",
+    }
+
+    def __init__(self, huggingface_model: str):
+        super().__init__(huggingface_model)
+        import open_clip
+
+        arch = huggingface_model.split('/')[-1]
+        tag = self._PRETRAINED_TAGS.get(arch)
+        if tag is None:
+            tags = open_clip.list_pretrained_tags_by_model(arch)
+            if not tags:
+                raise ValueError(f"No open_clip pretrained weights available for {arch}")
+            tag = tags[0]
+
+        self.model, _, self.processor = open_clip.create_model_and_transforms(
+            arch, pretrained=tag
+        )
+        # eval() is required: MobileCLIP relies on batchnorm layers.
+        self.model = self.model.to(self.device).eval()
+
+        # Structurally reparameterize the image backbone: MobileCLIP's MobileOne/
+        # RepMixer blocks keep several parallel conv+BN branches that are only
+        # useful at train time. Fusing them into a single equivalent conv yields
+        # mathematically identical embeddings while cutting inference cost
+        # (~1.3x faster on CPU). One-time cost at load.
+        try:
+            from timm.utils import reparameterize_model
+            self.model = reparameterize_model(self.model)
+        except Exception:
+            # Older timm without the util, or an arch lacking reparameterizable
+            # blocks: fall back to the un-fused (but correct) model.
+            pass
+
+        self.tokenizer = open_clip.get_tokenizer(arch)
+        self.can_handle_text = True
+
+    def to_vector(self, image: Image) -> np.ndarray:
+        tensor = self.processor(image.convert("RGB")).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            features = self.model.encode_image(tensor)
+            features = features / features.norm(dim=-1, keepdim=True)
+        return features.cpu().float().numpy().flatten()
+
+    def to_text_vector(self, text: str) -> np.ndarray:
+        tokens = self.tokenizer([text]).to(self.device)
+        with torch.no_grad():
+            features = self.model.encode_text(tokens)
+            features = features / features.norm(dim=-1, keepdim=True)
+        return features.cpu().float().numpy().flatten()
+
+
 type_to_class_mapping = {
     "mobilenet_v2": MobileNetTransformer,
     "dinov2": Dinov2Transformer,
@@ -300,7 +375,9 @@ type_to_class_mapping = {
     "siglip2": SIGLIPTransformer,
     "siglip": SIGLIPTransformer,
     "clip": CLIPTransformer,
-    "radio": RadioTransformer
+    "radio": RadioTransformer,
+    "mobileclip2": MobileClipTransformer,
+    "mobileclip": MobileClipTransformer,
 }
 
 

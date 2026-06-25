@@ -57,6 +57,8 @@ class ModelEnum(Enum):
     dinov2 = "facebook/dinov2-base"
     dinov3 = "phunghuy159/dinov3"
     radio = "nvidia/C-RADIOv4-H"
+    mobileclip_s2 = "apple/MobileCLIP2-S2"
+    mobileclip_l14 = "apple/MobileCLIP2-L-14"
 
 
 def vector_name(vec_type: VectorType):
