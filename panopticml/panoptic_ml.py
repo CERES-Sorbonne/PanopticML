@@ -83,7 +83,7 @@ class PanopticML(APlugin):
     def __init__(self, name: str, project, plugin_path: str):
         super().__init__(name=name, project=project, plugin_path=plugin_path)
         self.params = PluginParams()
-        self.project.on_instance_import(self._on_import)
+        self.project.on_import_complete(self._on_import)
         self.project.on_folder_delete(self._on_folder_delete)
         self.add_action_easy(self.create_default_vector_type, ['vector_type'])
         self.add_action_easy(self.create_custom_vector_type, ['vector_type'])
@@ -165,11 +165,44 @@ class PanopticML(APlugin):
     # Import / delete event hooks
     # ------------------------------------------------------------------
 
-    def _on_import(self, instances: list) -> None:
+    def _on_import(self, root_folder_id: int | None = None) -> None:
         if not self.params.compute_on_import:
             return
+        instances = self._instances_under_folder(root_folder_id)
+        print(instances)
         for vt in self.vector_types:
             self._enqueue_vectors_task(instances, vt)
+
+    def _instances_under_folder(self, root_folder_id: int | None) -> list:
+        """Resolve instances to (re)compute for an import event.
+
+        ``root_folder_id is None`` means "everything is new" — return all instances.
+        Otherwise walk the folder subtree rooted at ``root_folder_id`` and return
+        its instances. Instances link to folders through files (instance.file_id ->
+        file.folder_id), so we resolve subtree folders -> files -> instances.
+        ComputeVectorsTask skips already-vectorized instances, so it is safe to hand
+        over the whole subtree (including resynced folders).
+        """
+        if root_folder_id is None:
+            return self.project.get_instances()
+
+        folders = self.project.get_folders()
+        children_by_parent: dict[int, list[int]] = {}
+        for f in folders:
+            if f.parent is not None:
+                children_by_parent.setdefault(f.parent, []).append(f.id)
+
+        subtree_ids = [root_folder_id]
+        frontier = [root_folder_id]
+        while frontier:
+            frontier = [c for p in frontier for c in children_by_parent.get(p, [])]
+            subtree_ids.extend(frontier)
+
+        files = self.project.get_files(folder_id=subtree_ids)
+        file_ids = [f.id for f in files]
+        if not file_ids:
+            return []
+        return self.project.get_instances(file_id=file_ids)
 
     def _on_folder_delete(self, folders: list) -> None:
         for vt in self.vector_types:
