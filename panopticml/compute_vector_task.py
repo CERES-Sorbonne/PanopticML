@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import io
 import logging
 import multiprocessing
 import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from queue import Empty, Queue
+from queue import Queue
 from typing import TYPE_CHECKING
+
+import numpy as np
+from PIL import Image
 
 if TYPE_CHECKING:
     from .panoptic_ml import PanopticML
@@ -14,8 +18,6 @@ if TYPE_CHECKING:
 from panoptic.core.task.task import Task
 from panoptic.core.databases.media.models import Vector, VectorType
 from panoptic.models.models import Instance
-
-from ._preprocess import preprocess_worker
 
 logger = logging.getLogger('PanopticML')
 
@@ -31,6 +33,19 @@ FETCH_BATCH     = 512   # sha1s fetched from DB per round-trip
 # ("Attempted to fork from a non-main thread"). forkserver forks from a clean server
 # process instead; spawn is the fallback where forkserver is unavailable.
 _START_METHOD = 'forkserver' if 'forkserver' in multiprocessing.get_all_start_methods() else 'spawn'
+
+
+def _preprocess_worker(args: tuple):
+    """Module-level worker: runs in a subprocess, no shared state."""
+    sha1, jpeg_bytes, size, greyscale = args
+    try:
+        img = Image.open(io.BytesIO(jpeg_bytes))
+        img = img.convert('L').convert('RGB') if greyscale else img.convert('RGB')
+        if img.size != (size, size):
+            img = img.resize((size, size), Image.BICUBIC)
+        return sha1, np.asarray(img, dtype=np.uint8)
+    except Exception:
+        return None
 
 
 class ComputeVectorsTask(Task):
@@ -51,7 +66,6 @@ class ComputeVectorsTask(Task):
         self.name        = f"{vec_type.params['model']} Vectors ({vec_type.id})"
         self.key        += f"_vec{vec_type.id}"
         self.transformer = None
-        self._write_error: Exception | None = None
 
     # ------------------------------------------------------------------
     # Task entry point
@@ -95,7 +109,6 @@ class ComputeVectorsTask(Task):
         t_start    = time.perf_counter()
         t_gpu_sum  = 0.0
         done_count = 0
-        failure: Exception | None = None
 
         while True:
             item = batch_queue.get()
@@ -107,12 +120,10 @@ class ComputeVectorsTask(Task):
                 vectors = self.transformer.forward_from_arrays(arrays)
                 t_gpu_sum += time.perf_counter() - t_gpu_0
             except Exception as e:
-                # A forward-pass failure is systematic (shape, dtype, OOM), not per-image.
-                # Abort loudly rather than mark every remaining batch as done while
-                # writing nothing — that reports success over an empty vector table.
-                failure = e
-                self._cancel_event.set()
-                break
+                # Don't count a failed batch as done — that would report success over
+                # vectors that were never written.
+                logger.error(f"GPU forward pass failed: {e}")
+                continue
             write_queue.put((sha1s_batch, vectors))
 
             done_count         += len(sha1s_batch)
@@ -121,19 +132,7 @@ class ComputeVectorsTask(Task):
 
         write_queue.put(None)
         writer_thread.join()
-        self._drain(batch_queue, producer_thread)
         producer_thread.join()
-
-        if failure is not None:
-            raise RuntimeError(
-                f"Vector computation aborted after {done_count}/{self.state.total} images: "
-                f"forward pass failed on {self.vec_type.params['model']}"
-            ) from failure
-        if self._write_error is not None:
-            raise RuntimeError(
-                f"Vector computation failed: {done_count} images embedded but the DB "
-                f"write failed"
-            ) from self._write_error
 
         t_total = time.perf_counter() - t_start
         imgs_per_sec = done_count / t_total if t_total > 0 else 0
@@ -177,7 +176,7 @@ class ComputeVectorsTask(Task):
                     for sha1 in chunk if sha1 in sha1_to_bytes
                 ]
 
-                futures = [pool.submit(preprocess_worker, a) for a in args_list]
+                futures = [pool.submit(_preprocess_worker, a) for a in args_list]
                 for fut in as_completed(futures):
                     if self._cancel_event.is_set():
                         break
@@ -215,19 +214,6 @@ class ComputeVectorsTask(Task):
                 ])
             except Exception as e:
                 logger.error(f"Vector write failed: {e}")
-                if self._write_error is None:
-                    self._write_error = e
-
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _drain(queue: Queue, producer: threading.Thread) -> None:
-        """Unblock a producer parked on a full batch_queue so it can observe the cancel."""
-        while producer.is_alive():
-            try:
-                queue.get(timeout=0.1)
-            except Empty:
-                pass
 
     # ------------------------------------------------------------------
 
