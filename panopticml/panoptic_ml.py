@@ -1,25 +1,8 @@
 import base64
-import os
 import pickle
+import threading
 from collections import defaultdict
 from io import BytesIO
-from typing import TYPE_CHECKING
-
-import pacmap
-import umap
-
-
-def check_huggingface_connection():
-    import socket
-    try:
-        socket.create_connection(("huggingface.co", 443), timeout=2)
-        return True
-    except (OSError, socket.timeout):
-        os.environ['HF_HUB_OFFLINE'] = '1'
-        return False
-
-check_huggingface_connection()
-
 from enum import Enum
 
 import msgspec
@@ -27,20 +10,19 @@ import numpy as np
 import requests
 from PIL import Image
 from pydantic import BaseModel
-from sklearn.manifold import TSNE
 
 from panoptic.core.plugin.plugin import APlugin
 from panoptic.models.action_models import (
     ActionContext, ActionResult, Group, InputFile, Notif, NotifType,
     OwnVectorType, PropertyId, Score, ScoreList,
 )
+from panoptic.core.databases.data.models import Instance
 from panoptic.core.databases.media.models import Map, Vector, VectorType
-from panoptic.models.models import Instance
 
 from .compute import make_clusters
 from .compute.clustering import cluster_by_text
 from .compute.faiss_tree import FaissTreeManager
-from .compute.transformer import TransformerManager, type_to_class_mapping, extract_model_type
+from .compute.transformer import TransformerManager
 from .compute_vector_task import ComputeVectorsTask
 from .utils import is_image_url, ClusterByTagsEnum, process_tags, normalize_positions
 
@@ -54,6 +36,10 @@ def group_by_sha1(instances: list[Instance]) -> dict:
     return result
 
 
+# PaCMAP and UMAP fail below 4 points
+MIN_MAP_POINTS = 4
+
+
 class PluginParams(BaseModel):
     compute_on_import: bool = True
     save_text_searches: bool = False
@@ -63,7 +49,11 @@ class ModelEnum(Enum):
     clip = "openai/clip-vit-base-patch32"
     mobilenet = "google/mobilenet_v2_1.0_224"
     siglip = "google/siglip2-so400m-patch16-naflex"
-    dinov = "facebook/dinov2-base"
+    dinov2 = "facebook/dinov2-base"
+    dinov3 = "phunghuy159/dinov3"
+    radio = "nvidia/C-RADIOv4-H"
+    mobileclip_s2 = "apple/MobileCLIP2-S2"
+    mobileclip_l14 = "apple/MobileCLIP2-L-14"
 
 
 def vector_name(vec_type: VectorType) -> str:
@@ -101,18 +91,38 @@ class PanopticML(APlugin):
         self.trees = FaissTreeManager(self)
         self.transformers = TransformerManager()
         self.text_vectors: defaultdict = defaultdict(dict)
+        self._stopped = threading.Event()
 
     def _start(self) -> None:
-        for t in self.vector_types:
-            self.trees.get(t)
-            self.transformers.get(t)  # pre-warm: load model weights at startup
-
         if len(self.vector_types) == 0:
             vt = self.project.upsert_vector_type(
                 VectorType(id=-1, source=self.name,
                            params={"model": ModelEnum.clip.value, "greyscale": False})
             )
             self.vector_types.append(vt)
+
+        # Pre-warming (faiss tree build + model weight loading) takes seconds per
+        # vector type, so it runs off the startup path. Both managers are lazy and
+        # lock-protected, so an action firing before the warm-up finishes just
+        # loads what it needs itself.
+        threading.Thread(target=self._prewarm, name='panopticml-prewarm', daemon=True).start()
+
+    def _prewarm(self) -> None:
+        for t in list(self.vector_types):
+            if self._stopped.is_set():
+                return
+            try:
+                self.trees.get(t)
+                self.transformers.get(t)
+            except Exception as e:
+                print(f"PanopticML: pre-warm failed for vector type {t.id}: {e}")
+
+    def _stop(self) -> None:
+        # Release model weights (GPU memory included) and faiss indexes with the plugin.
+        self._stopped.set()
+        self.transformers.clear()
+        self.trees.trees.clear()
+        self.text_vectors.clear()
 
     # ------------------------------------------------------------------
     # Vector type creation
@@ -125,16 +135,22 @@ class PanopticML(APlugin):
         """
         vt = VectorType(id=-1, source=self.name, params={"model": model.value, "greyscale": greyscale})
         res = self.project.upsert_vector_type(vt)
-        return ActionResult(value=res)
+        return ActionResult(value=msgspec.structs.asdict(res))
 
     def create_custom_vector_type(self, ctx: ActionContext, model: str = '', greyscale: bool = False) -> ActionResult:
         """Create a vector type using a custom HuggingFace model name.
         @model: HuggingFace model identifier (e.g. openai/clip-vit-base-patch32)
         @greyscale: convert images to greyscale before embedding
         """
+        model = model.strip()
+        if not model:
+            return ActionResult(notifs=[Notif(
+                NotifType.ERROR, name="EmptyModel",
+                message="Please provide a HuggingFace model identifier",
+            )])
         vt = VectorType(id=-1, source=self.name, params={"model": model, "greyscale": greyscale})
         res = self.project.upsert_vector_type(vt)
-        return ActionResult(value=res)
+        return ActionResult(value=msgspec.structs.asdict(res))
 
     # ------------------------------------------------------------------
     # Vector computation
@@ -169,9 +185,14 @@ class PanopticML(APlugin):
         if not self.params.compute_on_import:
             return
         instances = self._instances_under_folder(root_folder_id)
-        print(instances)
-        for vt in self.vector_types:
+        for vt in self._refresh_vector_types():
             self._enqueue_vectors_task(instances, vt)
+
+    def _refresh_vector_types(self) -> list[VectorType]:
+        """Re-read this plugin's vector types. They can be created or deleted from the UI
+        after start() (the /delete_vector_type route doesn't go through the plugin)."""
+        self.vector_types = self.project.get_vector_types(source=self.name)
+        return self.vector_types
 
     def _instances_under_folder(self, root_folder_id: int | None) -> list:
         """Resolve instances to (re)compute for an import event.
@@ -205,7 +226,7 @@ class PanopticML(APlugin):
         return self.project.get_instances(file_id=file_ids)
 
     def _on_folder_delete(self, folders: list) -> None:
-        for vt in self.vector_types:
+        for vt in self._refresh_vector_types():
             self.trees.rebuild_tree(vt)
 
     # ------------------------------------------------------------------
@@ -285,6 +306,10 @@ class PanopticML(APlugin):
 
     def find_images(self, context: ActionContext, vec_type: OwnVectorType,
                     max_results: int = 200) -> ActionResult:
+        """Find images similar to the selected ones using cosine similarity.
+        @vec_type: vector space to search in
+        @max_results: maximum number of similar images to return (top-k neighbours)
+        """
         return self.find_images_from_file(context, vec_type, image_file=None,
                                           max_results=max_results)
 
@@ -362,27 +387,26 @@ class PanopticML(APlugin):
 
         self._load_text_vectors(vec_type)
         text_vectors = []
+        transformer = self.transformers.get(vec_type)
 
-        if text in self.text_vectors[vec_type]:
-            resulting_images = tree.query([self.text_vectors[vec_type][text]])
-        else:
-            transformer = self.transformers.get(vec_type)
-            try:
-                if is_image_url(text):
-                    im = Image.open(requests.get(text, stream=True).raw)
-                    vec = transformer.to_vector(im)
-                    resulting_images = tree.query([vec])
-                else:
-                    resulting_images, text_vectors = tree.query_texts([text], transformer, return_vec=True)
-            except ValueError as e:
-                return ActionResult(notifs=[Notif(NotifType.ERROR, name="TextSimilarityError", message=str(e))])
+        try:
+            max_text_sim = transformer.max_text_sim
+            if text in self.text_vectors[vec_type]:
+                resulting_images = tree.query([self.text_vectors[vec_type][text]])
+            elif is_image_url(text):
+                im = Image.open(requests.get(text, stream=True, timeout=30).raw)
+                vec = transformer.to_vector(im)
+                resulting_images = tree.query([vec])
+            else:
+                resulting_images, text_vectors = tree.query_texts([text], transformer, return_vec=True)
+        except ValueError as e:
+            return ActionResult(notifs=[Notif(NotifType.ERROR, name="TextSimilarityError", message=str(e))])
 
         filtered = [inst for inst in resulting_images if inst['sha1'] in context_sha1s]
         index = {r['sha1']: r['dist'] for r in filtered}
         res_sha1s = np.asarray(list(index.keys()))
         res_scores = np.asarray([index[sha1] for sha1 in res_sha1s])
 
-        max_text_sim = type_to_class_mapping[extract_model_type(vec_type)].max_text_sim
         remapped = np.around(np.interp(res_scores, [0, max_text_sim], [0, 1]), decimals=2)
         mask = remapped >= min_similarity
         final_sha1s = res_sha1s[mask].tolist()
@@ -433,9 +457,15 @@ class PanopticML(APlugin):
         if prefix:
             tags_text = [prefix + t for t in tags_text]
 
+        transformer = self.transformers.get(vec_type)
+        if not transformer.can_handle_text:
+            return ActionResult(notifs=[Notif(
+                NotifType.ERROR, name="TextSimilarityError",
+                message=f"Model {transformer.name} does not support text similarity",
+            )])
+
         texts_to_transform = []
         text_vectors = []
-        transformer = None
         self._load_text_vectors(vec_type)
 
         for text in tags_text:
@@ -445,7 +475,6 @@ class PanopticML(APlugin):
                 texts_to_transform.append(text)
 
         if texts_to_transform:
-            transformer = self.transformers.get(vec_type)
             transformed = transformer.get_text_vectors(texts_to_transform)
             text_vectors = [*transformed, *text_vectors]
             self._save_text_vectors(texts_to_transform, transformed, vec_type)
@@ -457,8 +486,8 @@ class PanopticML(APlugin):
                 message=f"No vectors ({vector_name(vec_type)}) found. Compute vectors first.",
             )])
 
-        max_text_sim = transformer.max_text_sim if transformer else 0.2
-        groups = cluster_by_text(pano_vectors, text_vectors, tags_text, min_similarity, max_text_sim, multiple)
+        groups = cluster_by_text(pano_vectors, text_vectors, tags_text, min_similarity,
+                                 transformer.max_text_sim, multiple)
         return ActionResult(groups=groups)
 
     # ------------------------------------------------------------------
@@ -473,10 +502,9 @@ class PanopticML(APlugin):
         instances = self._get_instances(ctx)
         sha1s = list({i.sha1 for i in instances})
         vectors = self.project.get_vectors(vec_type.id, sha1s=sha1s)
-        print(len(vectors))
-        if len(vectors) < 2:
+        if len(vectors) < MIN_MAP_POINTS:
             return ActionResult(notifs=[Notif(NotifType.ERROR, name="NoData",
-                message=f"Need at least 2 vectors to compute a map (got {len(vectors)}).")])
+                message=f"Need at least {MIN_MAP_POINTS} vectors to compute a map (got {len(vectors)}).")])
         points = self.project.run_in_executor(self._get_pacmap_coordinates, vectors)
         return self._save_map(points, vec_type, map_name or f"pacmap: {vec_type.params['model']}")
 
@@ -488,9 +516,9 @@ class PanopticML(APlugin):
         instances = self._get_instances(ctx)
         sha1s = list({i.sha1 for i in instances})
         vectors = self.project.get_vectors(vec_type.id, sha1s=sha1s)
-        if len(vectors) < 2:
+        if len(vectors) < MIN_MAP_POINTS:
             return ActionResult(notifs=[Notif(NotifType.ERROR, name="NoData",
-                message=f"Need at least 2 vectors to compute a map (got {len(vectors)}).")])
+                message=f"Need at least {MIN_MAP_POINTS} vectors to compute a map (got {len(vectors)}).")])
         points = self.project.run_in_executor(self._get_tsne_coordinates, vectors)
         return self._save_map(points, vec_type, map_name or f"tsne: {vec_type.params['model']}")
 
@@ -502,9 +530,9 @@ class PanopticML(APlugin):
         instances = self._get_instances(ctx)
         sha1s = list({i.sha1 for i in instances})
         vectors = self.project.get_vectors(vec_type.id, sha1s=sha1s)
-        if len(vectors) < 2:
+        if len(vectors) < MIN_MAP_POINTS:
             return ActionResult(notifs=[Notif(NotifType.ERROR, name="NoData",
-                message=f"Need at least 2 vectors to compute a map (got {len(vectors)}).")])
+                message=f"Need at least {MIN_MAP_POINTS} vectors to compute a map (got {len(vectors)}).")])
         points = self.project.run_in_executor(self._get_umap_coordinates, vectors)
         return self._save_map(points, vec_type, map_name or f"umap: {vec_type.params['model']}")
 
@@ -517,12 +545,13 @@ class PanopticML(APlugin):
             id=-1, source=self.name, name=name,
             key='sha1', count=len(points), data=flat,
         ))
-        return ActionResult(value={f.name: getattr(point_map, f.name) for f in msgspec.structs.fields(point_map)})
+        return ActionResult(value=msgspec.structs.asdict(point_map))
 
     @staticmethod
     def _get_pacmap_coordinates(vectors: list[Vector]) -> dict:
-        if len(vectors) < 2:
+        if len(vectors) < MIN_MAP_POINTS:
             return {}
+        import pacmap  # imported lazily: ~0.7s of numba/sklearn setup
         data = np.asarray([v.data for v in vectors])
         embedding = pacmap.PaCMAP(n_components=2, n_neighbors=10, MN_ratio=0.5, FP_ratio=2.0)
         result = embedding.fit_transform(data, init="pca")
@@ -530,16 +559,20 @@ class PanopticML(APlugin):
 
     @staticmethod
     def _get_tsne_coordinates(vectors: list[Vector]) -> dict:
-        if len(vectors) < 2:
+        if len(vectors) < MIN_MAP_POINTS:
             return {}
+        from sklearn.manifold import TSNE  # imported lazily
         data = np.asarray([v.data for v in vectors])
-        result = TSNE(n_components=2, perplexity=30, random_state=None).fit_transform(data)
+        # perplexity must stay below the number of samples
+        perplexity = min(30, len(vectors) - 1)
+        result = TSNE(n_components=2, perplexity=perplexity, random_state=None).fit_transform(data)
         return {vectors[i].sha1: result[i].tolist() for i in range(result.shape[0])}
 
     @staticmethod
     def _get_umap_coordinates(vectors: list[Vector]) -> dict:
-        if len(vectors) < 2:
+        if len(vectors) < MIN_MAP_POINTS:
             return {}
+        import umap  # imported lazily: ~2.4s of pynndescent/numba JIT setup
         data = np.asarray([v.data for v in vectors])
         result = umap.UMAP(n_components=2, random_state=None).fit_transform(data)
         return {vectors[i].sha1: result[i].tolist() for i in range(result.shape[0])}

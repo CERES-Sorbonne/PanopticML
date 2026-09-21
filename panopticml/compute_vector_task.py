@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import io
 import logging
-import multiprocessing
 import threading
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Queue
 from typing import TYPE_CHECKING
 
@@ -16,27 +15,41 @@ if TYPE_CHECKING:
     from .panoptic_ml import PanopticML
 
 from panoptic.core.task.task import Task
-from panoptic.core.databases.media.models import Vector, VectorType
-from panoptic.models.models import Instance
+from panoptic.core.databases.data.models import Instance
+from panoptic.core.databases.media.models import ImageType, Vector, VectorType
 
 logger = logging.getLogger('PanopticML')
 
 BATCH_SIZE      = 128   # images per GPU forward pass
-IO_WORKERS      = 8     # parallel processes for decode + resize
+IO_WORKERS      = 8     # parallel threads for decode + resize
 PREFETCH_QUEUED = 4     # preprocessed batches buffered ahead of the GPU
 WRITE_QUEUED    = 2     # GPU results buffered ahead of the DB writer
 FETCH_BATCH     = 512   # sha1s fetched from DB per round-trip
 
-# The pool is built from a worker thread, in a process where umap has already pulled in
-# numba (and, on Linux, its TBB threading layer) and torch may have initialized CUDA.
-# `fork` copies both into the child in an undefined state — TBB says so out loud
-# ("Attempted to fork from a non-main thread"). forkserver forks from a clean server
-# process instead; spawn is the fallback where forkserver is unavailable.
-_START_METHOD = 'forkserver' if 'forkserver' in multiprocessing.get_all_start_methods() else 'spawn'
+# Decode + resize run in a thread pool, not a process pool. PIL releases the GIL while it
+# decodes, converts and resizes, so threads scale almost as well here. A process pool has
+# to pickle the worker by module name, and a pool child can't import that module: the
+# plugin is loaded under its registered name (e.g. "PanopticML"), which is not the
+# package folder name for pip installs. The pool then breaks and the task waits forever.
+# Each child would also re-import torch and the whole plugin just to unpickle the worker.
+
+
+def _pick_image_type(image_types: list[ImageType], input_size: int) -> int:
+    """Id of the stored rendition to embed from.
+
+    The smallest rendition at least twice the model input, so both axes are downsampled,
+    else the largest. New projects store 'small' (256px) and 'large' (1024px). Projects
+    converted from Panoptic 0.x can have other renditions and ids.
+    """
+    sized = [(max(t.width or 0, t.height or 0), t.id) for t in image_types if t.width or t.height]
+    if not sized:
+        return image_types[0].id
+    big_enough = [s for s in sized if s[0] >= 2 * input_size]
+    return min(big_enough)[1] if big_enough else max(sized)[1]
 
 
 def _preprocess_worker(args: tuple):
-    """Module-level worker: runs in a subprocess, no shared state."""
+    """Decode + resize one stored image. Returns None if it can't be decoded."""
     sha1, jpeg_bytes, size, greyscale = args
     try:
         img = Image.open(io.BytesIO(jpeg_bytes))
@@ -51,7 +64,7 @@ def _preprocess_worker(args: tuple):
 class ComputeVectorsTask(Task):
     """
     3-stage pipeline to keep the GPU busy continuously:
-      stage 1 — process pool : fetch JPEG from DB + decode + resize (true multiprocessing)
+      stage 1 — thread pool  : fetch JPEG from DB + decode + resize
       stage 2 — GPU          : forward pass on a batch of preprocessed arrays
       stage 3 — DB writer    : upsert vectors to DB while GPU runs the next batch
     """
@@ -66,6 +79,8 @@ class ComputeVectorsTask(Task):
         self.name        = f"{vec_type.params['model']} Vectors ({vec_type.id})"
         self.key        += f"_vec{vec_type.id}"
         self.transformer = None
+        # `failed` is bumped from the producer, GPU and writer threads
+        self._failed_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Task entry point
@@ -80,17 +95,16 @@ class ComputeVectorsTask(Task):
             ).fetchall()
         existing = {row[0] for row in rows}
 
-        to_compute = [inst for inst in self.instances if inst.sha1 not in existing]
+        # vectors are per sha1: instances sharing an image are computed once
+        sha1s = list(dict.fromkeys(
+            inst.sha1 for inst in self.instances if inst.sha1 and inst.sha1 not in existing
+        ))
 
-        self.state.total   = len(to_compute)
-        self.state.running = True
+        self.state.total = len(sha1s)
         self._notify()
 
-        if not to_compute:
-            self._finish()
+        if not sha1s:
             return
-
-        sha1s = [inst.sha1 for inst in to_compute]
 
         batch_queue = Queue(maxsize=PREFETCH_QUEUED)
         write_queue = Queue(maxsize=WRITE_QUEUED)
@@ -114,21 +128,19 @@ class ComputeVectorsTask(Task):
             item = batch_queue.get()
             if item is None:
                 break
+            if self.is_cancelled():
+                continue  # keep draining so the producer can reach its sentinel
             sha1s_batch, arrays = item
             try:
                 t_gpu_0 = time.perf_counter()
                 vectors = self.transformer.forward_from_arrays(arrays)
                 t_gpu_sum += time.perf_counter() - t_gpu_0
             except Exception as e:
-                # Don't count a failed batch as done — that would report success over
-                # vectors that were never written.
                 logger.error(f"GPU forward pass failed: {e}")
+                self._add_failed(len(sha1s_batch))
                 continue
             write_queue.put((sha1s_batch, vectors))
-
-            done_count         += len(sha1s_batch)
-            self.state.done    += len(sha1s_batch)
-            self._notify()
+            done_count += len(sha1s_batch)
 
         write_queue.put(None)
         writer_thread.join()
@@ -144,8 +156,6 @@ class ComputeVectorsTask(Task):
             f"GPU time {t_gpu_sum:.1f}s ({gpu_pct:.0f}%)\n"
         )
 
-        self._finish()
-
     def on_last(self) -> None:
         self.plugin.rebuild_index(self.vec_type)
 
@@ -157,45 +167,56 @@ class ComputeVectorsTask(Task):
         size      = self.transformer.preprocess_size
         greyscale = self.vec_type.params.get('greyscale', False)
 
-        pool_ctx = multiprocessing.get_context(_START_METHOD)
-        with ProcessPoolExecutor(max_workers=IO_WORKERS, mp_context=pool_ctx) as pool:
-            batch_sha1s:  list[str] = []
-            batch_arrays: list      = []
+        try:
+            # The plugin interface has no public image access yet, hence _media_db().
+            with self.project._media_db() as db:
+                image_type = _pick_image_type(db.get_image_types(), size)
 
-            for i in range(0, len(sha1s), FETCH_BATCH):
-                if self._cancel_event.is_set():
-                    break
+            with ThreadPoolExecutor(max_workers=IO_WORKERS, thread_name_prefix='panopticml-decode') as pool:
+                batch_sha1s:  list[str] = []
+                batch_arrays: list      = []
 
-                chunk = sha1s[i:i + FETCH_BATCH]
-                with self.project._media_db() as db:
-                    images = db.get_images(type_id=2, sha1=chunk)
-                sha1_to_bytes = {img.sha1: img.data for img in images}
-
-                args_list = [
-                    (sha1, sha1_to_bytes[sha1], size, greyscale)
-                    for sha1 in chunk if sha1 in sha1_to_bytes
-                ]
-
-                futures = [pool.submit(_preprocess_worker, a) for a in args_list]
-                for fut in as_completed(futures):
-                    if self._cancel_event.is_set():
+                for i in range(0, len(sha1s), FETCH_BATCH):
+                    if self.is_cancelled():
                         break
-                    result = fut.result()
-                    if result is None:
-                        continue
-                    sha1, arr = result
-                    batch_sha1s.append(sha1)
-                    batch_arrays.append(arr)
 
-                    if len(batch_sha1s) >= BATCH_SIZE:
-                        out.put((batch_sha1s, batch_arrays))
-                        batch_sha1s  = []
-                        batch_arrays = []
+                    chunk = sha1s[i:i + FETCH_BATCH]
+                    with self.project._media_db() as db:
+                        images = db.get_images(type_id=image_type, sha1=chunk)
+                    sha1_to_bytes = {img.sha1: img.data for img in images}
 
-            if batch_sha1s:
-                out.put((batch_sha1s, batch_arrays))
+                    args_list = [
+                        (sha1, sha1_to_bytes[sha1], size, greyscale)
+                        for sha1 in chunk if sha1 in sha1_to_bytes
+                    ]
+                    failed = len(chunk) - len(args_list)  # no stored image to embed
 
-        out.put(None)  # sentinel
+                    futures = [pool.submit(_preprocess_worker, a) for a in args_list]
+                    for fut in as_completed(futures):
+                        if self.is_cancelled():
+                            break
+                        result = fut.result()
+                        if result is None:
+                            failed += 1
+                            continue
+                        sha1, arr = result
+                        batch_sha1s.append(sha1)
+                        batch_arrays.append(arr)
+
+                        if len(batch_sha1s) >= BATCH_SIZE:
+                            out.put((batch_sha1s, batch_arrays))
+                            batch_sha1s  = []
+                            batch_arrays = []
+
+                    if failed:
+                        self._add_failed(failed)
+
+                if batch_sha1s:
+                    out.put((batch_sha1s, batch_arrays))
+        except Exception as e:
+            logger.error(f"Image loading failed: {e}")
+        finally:
+            out.put(None)  # sentinel: always sent, the GPU loop waits for it
 
     # ------------------------------------------------------------------
     # Stage 3 — writer: DB upserts off the GPU path
@@ -214,11 +235,13 @@ class ComputeVectorsTask(Task):
                 ])
             except Exception as e:
                 logger.error(f"Vector write failed: {e}")
+                self._add_failed(len(sha1s))
+                continue
+            # counted once written: `done` never reports vectors that aren't in the DB
+            self.state.done += len(sha1s)
+            self._notify()
 
-    # ------------------------------------------------------------------
-
-    def _finish(self) -> None:
-        self.state.running  = False
-        self.state.finished = True
-        self._finished_event.set()
+    def _add_failed(self, n: int) -> None:
+        with self._failed_lock:
+            self.state.failed += n
         self._notify()

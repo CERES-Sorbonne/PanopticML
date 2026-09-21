@@ -8,7 +8,7 @@ import torch
 import re
 from PIL import Image
 
-from panoptic.models.models import Tag
+from panoptic.core.databases.data.models import Tag
 
 
 def preprocess_image(image_data: bytes, params: dict):

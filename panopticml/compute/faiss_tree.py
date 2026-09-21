@@ -1,5 +1,6 @@
 import os
 import pickle
+import threading
 
 import faiss
 import numpy as np
@@ -70,19 +71,21 @@ class FaissTreeManager:
     def __init__(self, plugin):
         self.trees: dict[int, FaissTree] = {}
         self.plugin = plugin
+        self._lock = threading.Lock()
 
     def get(self, vec_type: VectorType) -> FaissTree | None:
         type_id = vec_type.id
         if self.trees.get(type_id):
             return self.trees[type_id]
-        tree = load_faiss_tree(self.plugin, type_id)
-        if tree:
-            self.trees[type_id] = tree
+        with self._lock:
+            if self.trees.get(type_id):
+                return self.trees[type_id]
+            tree = load_faiss_tree(self.plugin, type_id)
+            if not tree:
+                tree = create_faiss_tree(self.plugin, type_id)
+            if tree:
+                self.trees[type_id] = tree
             return tree
-        tree = create_faiss_tree(self.plugin, type_id)
-        if tree:
-            self.trees[type_id] = tree
-        return tree
 
     def rebuild_tree(self, vec_type: VectorType) -> FaissTree | None:
         type_id = vec_type.id

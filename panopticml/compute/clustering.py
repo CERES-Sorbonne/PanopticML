@@ -1,7 +1,5 @@
 import faiss
 import numpy as np
-from fast_hdbscan import HDBSCAN
-# from sklearn.cluster import HDBSCAN
 import torch
 
 from panoptic.core.databases.media.models import Vector
@@ -53,6 +51,8 @@ def _make_clusters_faiss(vectors, nb_clusters=6, **kwargs) -> (np.ndarray, np.nd
 
     vectors = np.asarray(vectors)
     if nb_clusters == -1:
+        # imported lazily: numba JIT setup costs ~1s and only this branch needs it
+        from fast_hdbscan import HDBSCAN
         clusterer = HDBSCAN(min_cluster_size=5)
         indices = clusterer.fit_predict(vectors)
         # indices = clusterer.labels_
@@ -72,7 +72,8 @@ def _make_clusters_faiss(vectors, nb_clusters=6, **kwargs) -> (np.ndarray, np.nd
             dists = faiss.pairwise_distances(center_vector, cluster_vectors)[0]
             distances[cluster_mask] = dists
     else:
-        distances, indices = _make_single_kmean(vectors, nb_clusters)
+        # faiss refuses more centroids than points (e.g. clustering a small selection)
+        distances, indices = _make_single_kmean(vectors, min(nb_clusters, len(vectors)))
     return indices.flatten(), distances.flatten()
 
 
