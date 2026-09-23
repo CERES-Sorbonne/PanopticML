@@ -4,6 +4,11 @@ name: Tests Multi-Plateformes
 on:
   workflow_dispatch:
     inputs:
+      os:
+        description: "Système(s) à tester"
+        type: choice
+        options: [all, ubuntu-latest, windows-latest, macos-latest]
+        default: all
       panoptic-branch:
         description: "Branche GitHub de Panoptic à tester (vide : dernière version de panoptic sur PyPI)"
         default: ""
@@ -26,7 +31,7 @@ jobs:
       # Continue même si un OS échoue
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: ${{ fromJSON(inputs.os == 'all' && '["ubuntu-latest", "windows-latest", "macos-latest"]' || format('["{0}"]', inputs.os)) }}
         python-version: ['3.11', '3.12', '3.13']
 
     env:

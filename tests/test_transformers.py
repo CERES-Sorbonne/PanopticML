@@ -2,9 +2,10 @@ import gc
 import os
 import pathlib
 
-import faiss
 import pytest
 import numpy as np
+import torch  # noqa: F401  before faiss, see panopticml/compute/__init__.py
+import faiss
 
 from panopticml.compute.faiss_tree import FaissTree
 from panopticml.compute.transformer import get_transformer, Transformer
