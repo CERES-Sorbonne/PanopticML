@@ -88,16 +88,26 @@ def get_transformer(huggingface_model: str) -> 'Transformer':
 # ---------------------------------------------------------------------------
 
 class Transformer:
+    # reduced precision used on CUDA; models whose activations overflow fp16 use bfloat16
+    cuda_dtype = torch.float16
+
     def __init__(self, huggingface_model: str):
         from transformers import logging
         logging.set_verbosity_error()
         self.device = resolve_device()
-        self.dtype = torch.float16 if self.device == 'cuda' else torch.float32
+        self.dtype = self._resolve_dtype()
         self.processor = None
         self.model = None
         self.can_handle_text = False
         self.name = huggingface_model
         self.preprocess_size: int = 224  # overridden by subclasses
+
+    def _resolve_dtype(self) -> torch.dtype:
+        if self.device != 'cuda':
+            return torch.float32
+        if self.cuda_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+            return torch.float32  # pre-Ampere GPUs: fp16 would overflow, stay in full precision
+        return self.cuda_dtype
 
     @property
     def max_text_sim(self) -> float:
@@ -304,6 +314,9 @@ class Dinov3Transformer(Dinov2Transformer):
     """Meta DINOv3 vision transformer (needs transformers >= 4.56).
     See: https://huggingface.co/facebook/dinov3-vitb16-pretrain-lvd1689m
     """
+    # DINOv3 activations overflow fp16: every vector comes out NaN
+    cuda_dtype = torch.bfloat16
+
     def __init__(self, huggingface_model: str):
         super().__init__(huggingface_model)
         # CLS + register tokens, skipped when falling back to patch mean-pooling

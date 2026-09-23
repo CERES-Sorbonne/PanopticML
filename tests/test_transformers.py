@@ -8,6 +8,7 @@ import numpy as np
 
 from panopticml.compute.faiss_tree import FaissTree
 from panopticml.compute.transformer import get_transformer, Transformer
+from panopticml.compute_vector_task import _preprocess_worker
 from panopticml.panoptic_ml import ModelEnum
 from panopticml.utils import preprocess_image, cosine_similarity
 
@@ -38,6 +39,17 @@ def generate_vectors(transformer: Transformer, images=None):
         vectors.append(transformer.to_vector(image_data))
     return vectors, images
 
+
+def generate_fast_vectors(transformer: Transformer, images=None):
+    """Vectors through the production path: ComputeVectorsTask decodes + resizes with
+    _preprocess_worker, then embeds with forward_from_arrays (no HF processor)."""
+    images = get_images() if not images else images
+    arrays = []
+    for img_path in images:
+        _, array = _preprocess_worker((img_path.name, img_path.read_bytes(), transformer.preprocess_size, False))
+        arrays.append(array)
+    return list(transformer.forward_from_arrays(arrays)), images
+
 @pytest.fixture(scope='session')
 def all_models():
     models = {}
@@ -66,6 +78,7 @@ def test_image_to_vector(model_name, vector_type, all_models):
         # Vérifications
         assert isinstance(image_vector, np.ndarray), f"Le résultat doit être un numpy array pour {model_name}"
         assert image_vector.size > 0, f"Le vecteur ne doit pas être vide pour {model_name}"
+        assert np.isfinite(image_vector).all(), f"Le vecteur contient des NaN/inf pour {model_name}"
         print(f"Image convertie en vecteur de taille: {image_vector.shape}")
 
 
@@ -210,3 +223,50 @@ def test_text_image_similarity(model_name, all_models):
         )
 
 
+@pytest.mark.parametrize("model_name", transformers_to_test)
+def test_fast_path_matches_processor(model_name, all_models):
+    """
+    forward_from_arrays is what actually computes the stored vectors: it must give the same
+    dimension as the processor path (text / image queries use that one) and close vectors.
+    """
+    transformer = all_models[model_name]
+    slow_vectors, images = generate_vectors(transformer)
+    fast_vectors, _ = generate_fast_vectors(transformer, images)
+
+    for slow, fast, img in zip(slow_vectors, fast_vectors, images):
+        slow, fast = slow.flatten(), fast.flatten()
+        assert np.isfinite(fast).all(), f"Fast path vector for {img.name} contains NaN/inf"
+        assert fast.shape == slow.shape, f"{img.name}: fast path {fast.shape} vs processor {slow.shape}"
+        sim = float(np.dot(slow, fast) / (np.linalg.norm(slow) * np.linalg.norm(fast)))
+        # the fast path squashes to a square instead of resize + center crop
+        assert sim > 0.75, f"{img.name}: fast path vector too far from processor vector (cos={sim:.3f})"
+
+
+@pytest.mark.parametrize("model_name", transformers_to_test)
+def test_fast_path_image_image_similarity(model_name, all_models):
+    transformer = all_models[model_name]
+    image_vectors, images = generate_fast_vectors(transformer)
+    tree = create_faiss_tree(image_vectors, images)
+    test_image = pathlib.Path(__file__).parent / 'resources' / 'cropped_chat.png'
+    test_vectors, _ = generate_vectors(transformer, [test_image])
+    best_result = os.path.basename(tree.query([test_vectors[0]])[0]['sha1'])
+    assert best_result == "chat.png"
+
+
+@pytest.mark.parametrize("model_name", transformers_to_test)
+def test_fast_path_text_image_similarity(model_name, all_models):
+    """Text search runs against stored vectors, i.e. fast path ones."""
+    transformer = all_models[model_name]
+    if not transformer.can_handle_text:
+        pytest.skip(f"{model_name} does not handle text")
+    texts = ['A jumping spider', 'A bird', 'A happy dog', 'A small grey cat']
+    expected = ['spider.jpg', 'bird.gif', 'dog.jpg', 'chat.png']
+    image_vectors, images = generate_fast_vectors(transformer)
+
+    for text, expected_image in zip(texts, expected):
+        text_vector = transformer.to_text_vector(text)
+        sims = sorted(
+            ((float(cosine_similarity(text_vector, iv)), img.name) for iv, img in zip(image_vectors, images)),
+            reverse=True,
+        )
+        assert sims[0][1] == expected_image, f"'{text}': expected {expected_image}, got {sims[0][1]}"
