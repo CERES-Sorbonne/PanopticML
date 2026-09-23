@@ -76,6 +76,15 @@ jobs:
         pip install pytest
         pip install -e .
 
+    # TEMPORAIRE : vecteurs CLIP / SigLIP effondrés sur macOS, on isole la cause
+    - name: Diagnostic macOS
+      if: runner.os == 'macOS'
+      continue-on-error: true
+      run: |
+        python .github/diagnose_macos.py
+        echo "===== sans faiss (un seul libomp) ====="
+        python .github/diagnose_macos.py --no-faiss cpu
+
     - name: Lancement des tests avec pytest
       run: pytest tests -v --tb=short
 
