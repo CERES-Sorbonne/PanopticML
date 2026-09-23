@@ -1,4 +1,5 @@
 import io
+import os
 from enum import Enum
 
 import math
@@ -78,6 +79,12 @@ def similarity_matrix(vectors1: list[np.array], vectors2: list[np.array], multip
 def resolve_device() -> str:
     import logging
     logger = logging.getLogger('PanopticML')
+    # Backup when auto-detection picks a device that misbehaves (e.g. MPS on GitHub's
+    # virtualized macOS runners gives wrong CLIP / SigLIP vectors): cpu, cuda, mps...
+    forced = os.environ.get('PANOPTICML_DEVICE', '').strip().lower()
+    if forced:
+        logger.info(f"PanopticML: using {forced} (PANOPTICML_DEVICE)")
+        return forced
     if torch.cuda.is_available():
         logger.info("PanopticML: using CUDA")
         return 'cuda'

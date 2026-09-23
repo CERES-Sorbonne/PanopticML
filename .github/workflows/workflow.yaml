@@ -39,6 +39,8 @@ jobs:
       # noms de ModelEnum ; "all" teste tout (~11 Go de modèles par job)
       PANOPTICML_TEST_MODELS: ${{ inputs.all-models && 'all' || 'clip,siglip,dinov3' }}
       PANOPTIC_BRANCH: ${{ inputs.panoptic-branch }}
+      # Le GPU Metal virtualisé des runners macOS donne des vecteurs CLIP / SigLIP faux
+      PANOPTICML_DEVICE: ${{ startsWith(matrix.os, 'macos') && 'cpu' || '' }}
 
     steps:
     - name: Checkout du code
@@ -75,15 +77,6 @@ jobs:
       run: |
         pip install pytest
         pip install -e .
-
-    # TEMPORAIRE : vecteurs CLIP / SigLIP effondrés sur macOS, on isole la cause
-    - name: Diagnostic macOS
-      if: runner.os == 'macOS'
-      continue-on-error: true
-      run: |
-        python .github/diagnose_macos.py
-        echo "===== sans faiss (un seul libomp) ====="
-        python .github/diagnose_macos.py --no-faiss cpu
 
     - name: Lancement des tests avec pytest
       run: pytest tests -v --tb=short
