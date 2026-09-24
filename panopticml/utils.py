@@ -1,4 +1,5 @@
 import io
+import os
 from enum import Enum
 
 import math
@@ -8,7 +9,7 @@ import torch
 import re
 from PIL import Image
 
-from panoptic.models import Tag
+from panoptic.core.databases.data.models import Tag
 
 
 def preprocess_image(image_data: bytes, params: dict):
@@ -75,14 +76,23 @@ def similarity_matrix(vectors1: list[np.array], vectors2: list[np.array], multip
         #
         # return scores_list, indices_list
 
-def resolve_device():
-    device = 'cpu'
+def resolve_device() -> str:
+    import logging
+    logger = logging.getLogger('PanopticML')
+    # Backup when auto-detection picks a device that misbehaves (e.g. MPS on GitHub's
+    # virtualized macOS runners gives wrong CLIP / SigLIP vectors): cpu, cuda, mps...
+    forced = os.environ.get('PANOPTICML_DEVICE', '').strip().lower()
+    if forced:
+        logger.info(f"PanopticML: using {forced} (PANOPTICML_DEVICE)")
+        return forced
     if torch.cuda.is_available():
-        device = 'cuda'
-    # TODO: when silicon bugs are working again put it back
-    # elif torch.backends.mps.is_available():
-    #     device = 'mps'
-    return device
+        logger.info("PanopticML: using CUDA")
+        return 'cuda'
+    if torch.backends.mps.is_available():
+        logger.info("PanopticML: using MPS (Apple Silicon)")
+        return 'mps'
+    logger.info("PanopticML: using CPU")
+    return 'cpu'
 
 def is_image_url(url):
     pattern = re.compile(
@@ -208,6 +218,8 @@ def normalize_positions(data, max_dist):
             current_max_dist = dist
 
     # Calculate scaling factor
+    if current_max_dist == 0:
+        return data
     scale_factor = max_dist / current_max_dist
 
     # Scale all positions and rebuild the array

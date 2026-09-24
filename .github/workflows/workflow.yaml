@@ -1,47 +1,107 @@
 name: Tests Multi-Plateformes
 
-# Déclenchement manuel uniquement
+# Lancé sur chaque PR (le check « Tests OK » doit être vert pour merger) ou à la main
 on:
+  pull_request:
   workflow_dispatch:
+    inputs:
+      os:
+        description: "Système(s) à tester"
+        type: choice
+        options: [all, ubuntu-latest, windows-latest, macos-latest]
+        default: all
+      panoptic-branch:
+        description: "Branche GitHub de Panoptic à tester (vide : dernière version de panoptic sur PyPI)"
+        default: ""
+      all-models:
+        description: "Tester tous les modèles (sinon : clip, siglip et dinov3)"
+        type: boolean
+        default: false
+      debug:
+        description: "Ouvrir une session tmate si un job échoue"
+        type: boolean
+        default: false
+
+concurrency:
+  group: tests-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
 
 jobs:
   test:
     name: "Tests sur ${{ matrix.os }} : ${{ matrix.python-version }}"
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
 
     strategy:
       # Continue même si un OS échoue
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # Sur une PR, inputs est vide : tous les OS
+        os: ${{ fromJSON((inputs.os || 'all') == 'all' && '["ubuntu-latest", "windows-latest", "macos-latest"]' || format('["{0}"]', inputs.os)) }}
         python-version: ['3.11', '3.12', '3.13']
 
+    env:
+      HF_HUB_DISABLE_PROGRESS_BARS: "1"
+      # noms de ModelEnum ; "all" teste tout (~11 Go de modèles par job)
+      PANOPTICML_TEST_MODELS: ${{ inputs.all-models && 'all' || 'clip,siglip,dinov3' }}
+      # Sur une PR : Panoptic main, tant que Panoptic 1.0 n'est pas sur PyPI
+      PANOPTIC_BRANCH: ${{ github.event_name == 'pull_request' && 'main' || inputs.panoptic-branch }}
+      # Le GPU Metal virtualisé des runners macOS donne des vecteurs CLIP / SigLIP faux
+      PANOPTICML_DEVICE: ${{ startsWith(matrix.os, 'macos') && 'cpu' || '' }}
+
     steps:
-
-
-
     - name: Checkout du code
       uses: actions/checkout@v4
 
-    - name: Setup tmate session
-      # if: ${{ failure() }}
-      uses: mxschmitt/action-tmate@v3
-      
+    # Les modèles testés peuvent faire ~11 Go : on fait de la place sur le disque Linux
+    - name: Libération d'espace disque (Linux)
+      if: runner.os == 'Linux'
+      run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
     - name: Configuration de Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: ${{ matrix.python-version }}
+        cache: pip
 
     - name: Mise à jour de pip
       run: python -m pip install --upgrade pip
 
+    # Pas de GPU sur les runners : la version CPU de torch évite ~3 Go de libs CUDA
+    - name: Installation de torch CPU (Linux)
+      if: runner.os == 'Linux'
+      run: pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+    - name: Installation de panoptic (PyPI)
+      if: env.PANOPTIC_BRANCH == ''
+      run: pip install --upgrade panoptic
+
+    - name: Installation de panoptic (branche ${{ env.PANOPTIC_BRANCH }})
+      if: env.PANOPTIC_BRANCH != ''
+      run: pip install "panoptic @ git+https://github.com/CERES-Sorbonne/Panoptic.git@${{ env.PANOPTIC_BRANCH }}#subdirectory=panoptic_back"
+
     - name: Installation des dépendances
       run: |
         pip install pytest
-        pip install panoptic
         pip install -e .
 
     - name: Lancement des tests avec pytest
-      run: pytest -v --tb=short -s --capture=no
+      run: pytest tests -v --tb=short
 
+    - name: Session tmate de debug
+      if: ${{ failure() && inputs.debug }}
+      uses: mxschmitt/action-tmate@v3
+      timeout-minutes: 30
+      with:
+        limit-access-to-actor: true
 
+  # Check unique à déclarer comme obligatoire dans la protection de branche
+  tests-ok:
+    name: Tests OK
+    if: always()
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+    - name: Tous les jobs sont verts
+      if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+      run: exit 1

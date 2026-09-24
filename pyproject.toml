@@ -29,29 +29,22 @@ classifiers = [
 ]
 
 dependencies = [
-    #"torch==2.1.0; platform_system == 'Darwin'",
-    # "numpy<=1.26.0; platform_system == 'Darwin'",
-    "scikit-learn; platform_system != 'Darwin'",
-    "scikit-learn==1.5.0; platform_system == 'Darwin'",
-    "torch", #; platform_system != 'Darwin'",
+    "torch",
+    "torchvision",
+    "transformers>=4.56",  # DINOv3
+    "accelerate",  # needed by transformers for device_map
     "faiss-cpu<1.11.0",
+    "scikit-learn",
     "scipy",
+    "numpy",
     "fast_hdbscan",
     "umap-learn",
-    "numpy", #; platform_system != 'Darwin'",
-    "transformers<4.52.0",
-    "mistralai",
-    "torchvision",
     "pacmap",
-    "accelerate"
+    "timm",  # C-RADIO, MobileCLIP
+    "einops",  # C-RADIO
+    "open-clip-torch",  # MobileCLIP
 ]
 
-[project.optional-dependencies]
-cradio = [
-    "timm",
-    "einops",
-    "open-clip-torch"
-]
 
 [project.urls]
 "Homepage" = "https://github.com/CERES-Sorbonne/PanopticML"

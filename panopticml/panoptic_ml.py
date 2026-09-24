@@ -1,53 +1,48 @@
 import base64
-import os
 import pickle
+import threading
+from collections import defaultdict
 from io import BytesIO
-from typing import DefaultDict
-
-import pacmap
-import umap
-
-from panoptic.core.project.project import Project
-
-
-# deactivate searching for online model if internet is off. Could be made better but works okay for now
-def check_huggingface_connection():
-    import socket
-    try:
-        socket.create_connection(("huggingface.co", 443), timeout=2)
-        return True
-    except (OSError, socket.timeout):
-        os.environ['HF_HUB_OFFLINE'] = '1'
-        return False
-
-check_huggingface_connection()
-
 from enum import Enum
 
+import msgspec
 import numpy as np
 import requests
 from PIL import Image
 from pydantic import BaseModel
-from sklearn.manifold import TSNE
-
 
 from panoptic.core.plugin.plugin import APlugin
-from panoptic.models import Instance, ActionContext, PropertyId, PropertyType, VectorType, OwnVectorType, InputFile, Vector
-from panoptic.models.results import Group, ActionResult, Notif, NotifType, NotifFunction, ScoreList, Score
-from panoptic.utils import group_by_sha1
+from panoptic.models.action_models import (
+    ActionContext, ActionResult, Group, InputFile, Notif, NotifType,
+    OwnVectorType, PropertyId, Score, ScoreList,
+)
+from panoptic.core.databases.data.models import Instance
+from panoptic.core.databases.media.models import Map, Vector, VectorType
 
 from .compute import make_clusters
 from .compute.clustering import cluster_by_text
 from .compute.faiss_tree import FaissTreeManager
-from .compute.transformer import TransformerManager, type_to_class_mapping, extract_model_type
-from .compute_vector_task import ComputeVectorTask
+from .compute.transformer import TransformerManager
+from .compute_vector_task import ComputeVectorsTask
 from .utils import is_image_url, ClusterByTagsEnum, process_tags, normalize_positions
+
+
+def group_by_sha1(instances: list[Instance]) -> dict:
+    result: dict[str, list] = {}
+    for instance in instances:
+        if instance.sha1 not in result:
+            result[instance.sha1] = []
+        result[instance.sha1].append(instance)
+    return result
+
+
+# PaCMAP and UMAP fail below 4 points
+MIN_MAP_POINTS = 4
 
 
 class PluginParams(BaseModel):
     compute_on_import: bool = True
     save_text_searches: bool = False
-
 
 
 class ModelEnum(Enum):
@@ -61,28 +56,30 @@ class ModelEnum(Enum):
     mobileclip_l14 = "apple/MobileCLIP2-L-14"
 
 
-def vector_name(vec_type: VectorType):
+def vector_name(vec_type: VectorType) -> str:
     res = f"{vec_type.id}: {vec_type.source}"
     if vec_type.params:
         for k in vec_type.params:
             res += f'_{k}_{vec_type.params[k]}'
     return res
 
+
 class PanopticML(APlugin):
     """
-    Default Machine Learning plugin for Panoptic
-    Uses CLIP to generate vectors and FAISS for clustering / similarity functions
+    Default Machine Learning plugin for Panoptic.
+    Uses CLIP to generate vectors and FAISS for clustering / similarity functions.
     """
 
-    def __init__(self, project: Project, plugin_path: str, name: str):
+    def __init__(self, name: str, project, plugin_path: str):
         super().__init__(name=name, project=project, plugin_path=plugin_path)
-        self.params: PluginParams = PluginParams()
-        self.project.on_instance_import(self.compute_image_vectors_on_import)
-        self.project.on_folder_delete(self.rebuild_trees)
+        self.params = PluginParams()
+        self.project.on_import_complete(self._on_import)
+        self.project.on_folder_delete(self._on_folder_delete)
         self.add_action_easy(self.create_default_vector_type, ['vector_type'])
         self.add_action_easy(self.create_custom_vector_type, ['vector_type'])
-        self._comp_vec_desc = self.add_action_easy(self.compute_vectors, ['vector'])
-        self.add_action_easy(self.find_images, ['similar', 'execute'])
+        self.add_action_easy(self.compute_vectors, ['vector'])
+        self.add_action_easy(self.find_images, ['similar'])
+        self.add_action_easy(self.find_images_from_file, ['execute'])
         self.add_action_easy(self.compute_clusters, ['group'])
         self.add_action_easy(self.cluster_by_tags, ['group'])
         self.add_action_easy(self.find_duplicates, ['group'])
@@ -93,409 +90,504 @@ class PanopticML(APlugin):
 
         self.trees = FaissTreeManager(self)
         self.transformers = TransformerManager()
-        # use to store text_vectors computed in differents functions
-        self.text_vectors = DefaultDict(dict)
+        self.text_vectors: defaultdict = defaultdict(dict)
+        self._stopped = threading.Event()
 
-    async def start(self):
-        await super().start()
-
-        [await self.trees.get(t) for t in self.vector_types]
-
+    def _start(self) -> None:
         if len(self.vector_types) == 0:
-            await self.project.add_vector_type(VectorType(id=-1, source=self.name,
-                                                          params={"model": ModelEnum.clip.value, "greyscale": False}))
+            vt = self.project.upsert_vector_type(
+                VectorType(id=-1, source=self.name,
+                           params={"model": ModelEnum.clip.value, "greyscale": False})
+            )
+            self.vector_types.append(vt)
 
-    async def create_default_vector_type(self, ctx: ActionContext, model: ModelEnum, greyscale: bool):
-        vec = VectorType(id=-1, source=self.name, params={"model": model.value, "greyscale": greyscale})
-        res = await self.project.add_vector_type(vec)
-        return ActionResult(value=res)
+        # Pre-warming (faiss tree build + model weight loading) takes seconds per
+        # vector type, so it runs off the startup path. Both managers are lazy and
+        # lock-protected, so an action firing before the warm-up finishes just
+        # loads what it needs itself.
+        threading.Thread(target=self._prewarm, name='panopticml-prewarm', daemon=True).start()
 
-    async def create_custom_vector_type(self, ctx: ActionContext, model: str, greyscale: bool):
-        vec = VectorType(id=-1, source=self.name, params={"model": model, "greyscale": greyscale})
-        res = await self.project.add_vector_type(vec)
-        return ActionResult(value=res)
+    def _prewarm(self) -> None:
+        for t in list(self.vector_types):
+            if self._stopped.is_set():
+                return
+            try:
+                self.trees.get(t)
+                self.transformers.get(t)
+            except Exception as e:
+                print(f"PanopticML: pre-warm failed for vector type {t.id}: {e}")
 
-    def _get_vector_func_notifs(self, vec_type: VectorType):
-        res = [
-            NotifFunction(self._comp_vec_desc.id,
-                          ActionContext(ui_inputs={"vec_type": vec_type}),
-                          message=f"Compute vectors: {vector_name(vec_type)}")
-        ]
-        return res
+    def _stop(self) -> None:
+        # Release model weights (GPU memory included) and faiss indexes with the plugin.
+        self._stopped.set()
+        self.transformers.clear()
+        self.trees.trees.clear()
+        self.text_vectors.clear()
 
-    async def compute_vectors(self, context: ActionContext, vec_type: OwnVectorType):
-        instances = await self.project.get_instances(ids=context.instance_ids)
-        for i in instances:
-            await self._compute_image_vector(i, vec_type)
+    # ------------------------------------------------------------------
+    # Vector type creation
+    # ------------------------------------------------------------------
 
-        notif = Notif(type=NotifType.INFO,
-                      name="ComputeVector",
-                      message=f"Successfully started compute of vectors {vector_name(vec_type)}")
-        return ActionResult(notifs=[notif])
+    def create_default_vector_type(self, ctx: ActionContext, model: ModelEnum = ModelEnum.clip, greyscale: bool = False) -> ActionResult:
+        """Create a vector type using a predefined model.
+        @model: the embedding model to use
+        @greyscale: convert images to greyscale before embedding
+        """
+        vt = VectorType(id=-1, source=self.name, params={"model": model.value, "greyscale": greyscale})
+        res = self.project.upsert_vector_type(vt)
+        return ActionResult(value=msgspec.structs.asdict(res))
 
-    async def compute_image_vectors_on_import(self, instance: Instance):
-        if not self.params.compute_on_import:
+    def create_custom_vector_type(self, ctx: ActionContext, model: str = '', greyscale: bool = False) -> ActionResult:
+        """Create a vector type using a custom HuggingFace model name.
+        @model: HuggingFace model identifier (e.g. openai/clip-vit-base-patch32)
+        @greyscale: convert images to greyscale before embedding
+        """
+        model = model.strip()
+        if not model:
+            return ActionResult(notifs=[Notif(
+                NotifType.ERROR, name="EmptyModel",
+                message="Please provide a HuggingFace model identifier",
+            )])
+        vt = VectorType(id=-1, source=self.name, params={"model": model, "greyscale": greyscale})
+        res = self.project.upsert_vector_type(vt)
+        return ActionResult(value=msgspec.structs.asdict(res))
+
+    # ------------------------------------------------------------------
+    # Vector computation
+    # ------------------------------------------------------------------
+
+    def compute_vectors(self, context: ActionContext, vec_type: OwnVectorType) -> ActionResult:
+        """Compute image embedding vectors for selected images.
+        @vec_type: the vector space to compute into
+        """
+        instances = self._get_instances(context)
+        self._enqueue_vectors_task(instances, vec_type)
+        return ActionResult(notifs=[Notif(
+            type=NotifType.INFO,
+            name="ComputeVector",
+            message=f"Started computing vectors {vector_name(vec_type)} for {len(instances)} images",
+        )])
+
+    def _enqueue_vectors_task(self, instances: list, vec_type: VectorType) -> None:
+        if not instances:
             return
-        for t in self.vector_types:
-            await self._compute_image_vector(instance, t)
-
-    async def _compute_image_vector(self, instance: Instance, vec_type: VectorType):
-        transformer = await self.transformers.async_get(self.project, vec_type)
-        task = ComputeVectorTask(self, vec_type, instance, self.data_path, transformer)
+        task = ComputeVectorsTask(self, vec_type, instances)
         self.project.add_task(task)
 
-    async def compute_clusters(self, context: ActionContext, vec_type: OwnVectorType,
-                               nb_clusters: int = 10): #, label_clusters: bool = False):
+    def rebuild_index(self, vec_type: VectorType) -> None:
+        self.trees.rebuild_tree(vec_type)
+
+    # ------------------------------------------------------------------
+    # Import / delete event hooks
+    # ------------------------------------------------------------------
+
+    def _on_import(self, root_folder_id: int | None = None) -> None:
+        if not self.params.compute_on_import:
+            return
+        instances = self._instances_under_folder(root_folder_id)
+        for vt in self._refresh_vector_types():
+            self._enqueue_vectors_task(instances, vt)
+
+    def _refresh_vector_types(self) -> list[VectorType]:
+        """Re-read this plugin's vector types. They can be created or deleted from the UI
+        after start() (the /delete_vector_type route doesn't go through the plugin)."""
+        self.vector_types = self.project.get_vector_types(source=self.name)
+        return self.vector_types
+
+    def _instances_under_folder(self, root_folder_id: int | None) -> list:
+        """Resolve instances to (re)compute for an import event.
+
+        ``root_folder_id is None`` means "everything is new" — return all instances.
+        Otherwise walk the folder subtree rooted at ``root_folder_id`` and return
+        its instances. Instances link to folders through files (instance.file_id ->
+        file.folder_id), so we resolve subtree folders -> files -> instances.
+        ComputeVectorsTask skips already-vectorized instances, so it is safe to hand
+        over the whole subtree (including resynced folders).
         """
-        Computes images clusters with Faiss Kmeans
+        if root_folder_id is None:
+            return self.project.get_instances()
+
+        folders = self.project.get_folders()
+        children_by_parent: dict[int, list[int]] = {}
+        for f in folders:
+            if f.parent is not None:
+                children_by_parent.setdefault(f.parent, []).append(f.id)
+
+        subtree_ids = [root_folder_id]
+        frontier = [root_folder_id]
+        while frontier:
+            frontier = [c for p in frontier for c in children_by_parent.get(p, [])]
+            subtree_ids.extend(frontier)
+
+        files = self.project.get_files(folder_id=subtree_ids)
+        file_ids = [f.id for f in files]
+        if not file_ids:
+            return []
+        return self.project.get_instances(file_id=file_ids)
+
+    def _on_folder_delete(self, folders: list) -> None:
+        for vt in self._refresh_vector_types():
+            self.trees.rebuild_tree(vt)
+
+    # ------------------------------------------------------------------
+    # Clustering
+    # ------------------------------------------------------------------
+
+    def compute_clusters(self, context: ActionContext, vec_type: OwnVectorType,
+                         nb_clusters: int = 10) -> ActionResult:
+        """Compute image clusters with Faiss K-means.
+        @vec_type: vector space to cluster in
         @nb_clusters: requested number of clusters
         """
-        instances = await self.project.get_instances(context.instance_ids)
+        instances = self._get_instances(context)
         sha1_to_instance = group_by_sha1(instances)
-        sha1_to_ahash = {i.sha1: i.ahash for i in instances}
         sha1s = list(sha1_to_instance.keys())
         if not sha1s:
-            empty_notif = Notif(NotifType.ERROR, name="NoData", message="No instance found")
-            return ActionResult(notifs=[empty_notif])
+            return ActionResult(notifs=[Notif(NotifType.ERROR, name="NoData", message="No instances found")])
 
-        vectors = await self.project.get_vectors(type_id=vec_type.id, sha1s=sha1s)
-
+        vectors = self.project.get_vectors(type_id=vec_type.id, sha1s=sha1s)
         if not vectors:
-            empty_notif = Notif(NotifType.ERROR,
-                                name="NoData",
-                                message=f"""For the clustering function image vectors are needed.
-                                        No such vectors ({vec_type.id}) could be found. 
-                                        Compute the vectors and try again.) """,
-                                functions=self._get_vector_func_notifs(vec_type))
-            return ActionResult(notifs=[empty_notif])
-        clusters, distances = await self.project.run_async(make_clusters, vectors, method="kmeans", nb_clusters=nb_clusters)
+            return ActionResult(notifs=[Notif(
+                NotifType.ERROR,
+                name="NoData",
+                message=f"No vectors ({vector_name(vec_type)}) found. Compute vectors first.",
+            )])
+
+        clusters, distances = make_clusters(vectors, method="kmeans", nb_clusters=nb_clusters)
+
         groups = []
-        groups_images = []
-        labels = []
-        i = 0
-        # TODO: put back mistral when it's working properly
-        # if label_clusters:
-        #     from ..mistral_test import create_labels_from_group, generate_group_image
-        for cluster, distance in zip(clusters, distances):
-            group = Group(score=Score(min=0, max=100, max_is_best=False, value=distance))
-            # if label_clusters:
-            #     images = [sha1_to_instance[sha1][0].url for sha1 in cluster[:20]]
-            #     groups_images.append(generate_group_image(images, i))
-            #     i += 1
-            group.sha1s = sorted(cluster, key=lambda sha1: sha1_to_ahash[sha1])
+        for i, (cluster, distance) in enumerate(zip(clusters, distances)):
+            group = Group(score=Score(value=float(distance), min=0, max=100, max_is_best=False))
+            group.sha1s = sorted(cluster)
+            group.name = f"Cluster {i}"
             groups.append(group)
-        # if len(groups_images) > 0:
-        #     labels = create_labels_from_group(groups_images)
-        for i, g in enumerate(groups):
-            g.name = f"Cluster {i}" if not len(labels) > 0 else "-".join(labels[i])
 
         return ActionResult(groups=groups)
 
-    async def find_images(self, context: ActionContext, vec_type: VectorType, image_file: InputFile = None):
+    def find_duplicates(self, context: ActionContext, vec_type: OwnVectorType,
+                        min_similarity: float = 0.95) -> ActionResult:
+        """Find near-duplicate images by similarity threshold.
+        @vec_type: vector space to compare in
+        @min_similarity: minimum cosine similarity to consider images duplicates
         """
-        Find Similar images using Cosine distances.
-        dist: 0 -> images are considered highly dissimilar
-        dist: 1 -> images are considered identical
-        See: https://en.wikipedia.org/wiki/Cosine_similarity for more.
-        """
-        ignore_sha1s = set()
-        print(image_file)
-        if image_file is None:
-            instances = await self.project.get_instances(context.instance_ids)
-            sha1s = [i.sha1 for i in instances]
-            ignore_sha1s = set(sha1s)
-            vectors = await self.project.get_vectors(type_id=vec_type.id, sha1s=sha1s)
-        else:
-            im = Image.open(BytesIO(base64.b64decode(image_file)))
-            if im.mode in ("RGBA", "P"):
-                im = im.convert("RGB")
-            transformer = await self.transformers.async_get(self.project, vec_type)
-            vectors = [transformer.to_vector(im)]
-
-        if not vectors:
-            return ActionResult(notifs=[Notif(
-                NotifType.ERROR,
-                name="NoData",
-                message=f"""For the similarity function image vectors are needed.
-                            No such vectors ({vector_name(vec_type)}) could be found. 
-                            Compute the vectors and try again.) """,
-                functions=self._get_vector_func_notifs(vec_type))])
-
-        vector_datas = [x.data for x in vectors]
-
-        tree = await self.trees.get(vec_type)
-        if not tree:
-            notif = Notif(type=NotifType.ERROR, name="NoFaissTree",
-                          message=f"No Faiss tree could be loaded for vec_type {vec_type.value}")
-            return ActionResult(notifs=[notif])
-
-        res = tree.query(vector_datas)
-        index = {r['sha1']: r['dist'] for r in res if r['sha1'] not in ignore_sha1s}
-
-        res_sha1s = list(index.keys())
-        res_scores = ScoreList(min=0, max=1, values=[index[sha1] for sha1 in res_sha1s],
-                               max_is_best=True,
-                               description="Similarity between 0 and 1. 1 is best")
-
-        res = Group(sha1s=res_sha1s, scores=res_scores)
-        return ActionResult(groups=[res])
-
-    async def search_by_text(self, context: ActionContext, vec_type: VectorType, text: str = '',
-                             min_similarity: float = 0.5):
-        """Search image using text similarity"""
-        if text == '':
-            notif = Notif(type=NotifType.ERROR, name="EmptySearchText",
-                          message="Please give a valid and not empty text search argument")
-            return ActionResult(notifs=[notif])
-
-        context_instances = await self.project.get_instances(context.instance_ids)
-        context_sha1s = [i.sha1 for i in context_instances]
-
-        tree = await self.trees.get(vec_type)
-        if not tree:
-            notif = Notif(type=NotifType.ERROR, name="NoFaissTree",
-                          message=f"No Faiss tree could be loaded for vec_type {vec_type.value}")
-            return ActionResult(notifs=[notif])
-
-        self._load_text_vectors(vec_type)
-        text_vectors = []
-        if text in self.text_vectors[vec_type]:
-            resulting_images = tree.query([self.text_vectors[vec_type][text]])
-        else:
-            transformer = await self.transformers.async_get(self.project, vec_type)
-            try:
-                if is_image_url(text):
-                    im = Image.open(requests.get(text, stream=True).raw)
-                    vec = transformer.to_vector(im)
-                    resulting_images = tree.query([vec])
-                else:
-                    resulting_images, text_vectors = tree.query_texts([text], self.transformers.get(vec_type), return_vec=True)
-            except ValueError as e:
-                return ActionResult(notifs=[Notif(type=NotifType.ERROR, name="TextSimilarityError", message=str(e))])
-
-
-        # filter out images if they are not in the current context
-        filtered_instances = [inst for inst in resulting_images if inst['sha1'] in context_sha1s]
-
-        index = {r['sha1']: r['dist'] for r in filtered_instances}
-        res_sha1s = np.asarray(list(index.keys()))
-        res_scores = np.asarray([index[sha1] for sha1 in res_sha1s])
-
-        # remap score since text to image similary tends to vary from a model to another, for instance CLIP is between 0.0 and 0.4 and filter by similarity
-        max_text_sim = type_to_class_mapping[extract_model_type(vec_type)].max_text_sim
-        remaped_scores = np.around(np.interp(res_scores, [0, max_text_sim], [0, 1]), decimals=2)
-        final_scores = remaped_scores[remaped_scores >= min_similarity].tolist()
-        final_sha1s = res_sha1s[remaped_scores >= min_similarity].tolist()
-
-        scores = ScoreList(min=0, max=1, values=final_scores,
-                           description="Similarity between image and text never give less than 0.1 and more than 0.4, hence here the values, remapped between 0 and 1")
-        res = Group(sha1s=final_sha1s, scores=scores)
-        res.name = "Text Search: " + text
-        if self.params.save_text_searches and len(text_vectors) > 0:
-            self._save_text_vectors([text], text_vectors, vec_type)
-        return ActionResult(groups=[res])
-
-    async def cluster_by_tags(self, context: ActionContext, tags: PropertyId, vec_type: VectorType, min_similarity: float = 0.5,
-                              parent_tags: ClusterByTagsEnum = ClusterByTagsEnum.use, multiple: bool = False, prefix: str = '',):
-        """Cluster images using a Tag/MultiTag property to guide the result"""
-        props = await self.project.get_properties(ids=[tags])
-        tag_prop = props[0]
-        if tag_prop.type != PropertyType.tag and tag_prop.type != PropertyType.multi_tags:
-            notif = Notif(type=NotifType.ERROR,
-                          name="WrongPropertyType",
-                          message=f"""Property: <{tag_prop.name}> is not of type Tag or MultiTags. This function only
-                                  accepts tag types properties. Please choose another property""")
-            return ActionResult(notifs=[notif])
-
-        instances = await self.project.get_instances(context.instance_ids)
+        instances = self._get_instances(context)
         sha1_to_instance = group_by_sha1(instances)
         sha1s = list(sha1_to_instance.keys())
         if not sha1s:
-            return None
-        # TODO: get tags text from the PropertyId
-        tags = await self.project.get_tags(property_ids=[tags])
-        tags_text = process_tags(tags, parent_tags=parent_tags)
-        if prefix:
-            tags_text = [prefix + text for text in tags_text]
-        texts_to_transform = []
-        text_vectors = []
-        transformer = None
-        self._load_text_vectors(vec_type)
-        for text in tags_text:
-            if text in self.text_vectors:
-                text_vectors.append(self.text_vectors[text])
-            else:
-                texts_to_transform.append(text)
-        if len(texts_to_transform) > 0:
-            transformer = await self.transformers.async_get(self.project, vec_type)
-            transformed_texts = transformer.get_text_vectors(texts_to_transform)
-            text_vectors = [*transformed_texts, *text_vectors]
-            self._save_text_vectors(texts_to_transform, transformed_texts, vec_type)
-        pano_vectors = await self.project.get_vectors(type_id=vec_type.id, sha1s=sha1s)
+            return ActionResult()
 
-        if not pano_vectors:
-            return ActionResult(notifs=[Notif(
-                NotifType.ERROR,
-                name="NoData",
-                message=f"""The Cluster_By_Tags function needs images vectors.
-                            No such vectors ({vec_type.value}) could be found. 
-                            Compute the vectors and try again.) """,
-                functions=self._get_vector_func_notifs(vec_type))])
-
-        max_text_sim = transformer.max_text_sim if transformer else 0.2
-        groups = cluster_by_text(pano_vectors, text_vectors, tags_text, min_similarity, max_text_sim, multiple)
-
-        return ActionResult(groups=groups)
-
-    async def find_duplicates(self, context: ActionContext, vec_type: VectorType, min_similarity: float = 0.95):
-        """
-        Create clusters with at least `min_similarity` between the images of the cluster
-        @min_similarity: the minimal similarity value between images of the cluster
-        """
-        # on récupère les vecteurs
-        # pour chaque vecteur on récupère ses plus similaires (150 pour test) puis on filtre tout ce qui est < min_similarity
-        # on marque tous les images dans le cluster pour ne pas les requêter à nouveau
-        instances = await self.project.get_instances(context.instance_ids)
-        sha1_to_instance = group_by_sha1(instances)
-        sha1s = list(sha1_to_instance.keys())
-        if not sha1s:
-            return None
-        # TODO: get tags text from the PropertyId
-        pano_vectors = await self.project.get_vectors(type_id=vec_type.id, sha1s=sha1s)
-        tree = await self.trees.get(vec_type)
-        groups = await self.project.run_async(self._compute_duplicate_groups, tree, pano_vectors, min_similarity)
+        pano_vectors = self.project.get_vectors(type_id=vec_type.id, sha1s=sha1s)
+        tree = self.trees.get(vec_type)
+        groups = self._compute_duplicate_groups(tree, pano_vectors, min_similarity)
         return ActionResult(groups=groups)
 
     @staticmethod
     def _compute_duplicate_groups(tree, pano_vectors, min_similarity):
-        vectors, sha1s = zip(*[(i.data, i.sha1) for i in pano_vectors])
+        vectors_sha1 = [(i.data, i.sha1) for i in pano_vectors]
+        sha1_set = {sha1 for _, sha1 in vectors_sha1}
         already_in_clusters = set()
         groups = []
-        for vector, sha1 in zip(vectors, sha1s):
+        for vector, sha1 in vectors_sha1:
             if sha1 in already_in_clusters:
                 continue
-            res = tree.query([vector.data], 150)
-            filtered = [r for r in res if r['dist'] >= min_similarity and r['sha1'] in sha1s]
+            res = tree.query([vector], 150)
+            filtered = [r for r in res if r['dist'] >= min_similarity and r['sha1'] in sha1_set]
             res_sha1s = [r['sha1'] for r in filtered]
             res_scores = [r['dist'] for r in filtered]
-            score_list = ScoreList(min=0, max=1, max_is_best=True, values=res_scores)
-            if len(res_sha1s) == 1:
+            if len(res_sha1s) <= 1:
                 continue
             already_in_clusters.update(res_sha1s)
-            groups.append(Group(sha1s=res_sha1s, scores=score_list))
+            groups.append(Group(sha1s=res_sha1s, scores=ScoreList(min=0, max=1, max_is_best=True, values=res_scores)))
         return groups
-        return groups
 
-    async def pacmap(self, ctx: ActionContext, vec_type: OwnVectorType, map_name: str = ""):
-        instances = await self.project.get_instances(ctx.instance_ids)
+    # ------------------------------------------------------------------
+    # Similarity search
+    # ------------------------------------------------------------------
+
+    def find_images(self, context: ActionContext, vec_type: OwnVectorType,
+                    max_results: int = 200) -> ActionResult:
+        """Find images similar to the selected ones using cosine similarity.
+        @vec_type: vector space to search in
+        @max_results: maximum number of similar images to return (top-k neighbours)
+        """
+        return self.find_images_from_file(context, vec_type, image_file=None,
+                                          max_results=max_results)
+
+    def find_images_from_file(self, context: ActionContext, vec_type: OwnVectorType,
+                    image_file: InputFile = None, max_results: int = 200) -> ActionResult:
+        """Find similar images using cosine similarity.
+        @vec_type: vector space to search in
+        @image_file: optional uploaded image to search by (defaults to selected images)
+        @max_results: maximum number of similar images to return (top-k neighbours)
+        """
+        ignore_sha1s: set = set()
+
+        if image_file is None:
+            instances = self._get_instances(context)
+            sha1s = [i.sha1 for i in instances]
+            ignore_sha1s = set(sha1s)
+            raw_vectors = self.project.get_vectors(type_id=vec_type.id, sha1s=sha1s)
+            vector_datas = [x.data for x in raw_vectors]
+        else:
+            im = Image.open(BytesIO(base64.b64decode(image_file)))
+            if im.mode in ("RGBA", "P"):
+                im = im.convert("RGB")
+            transformer = self.transformers.get(vec_type)
+            vector_datas = [transformer.to_vector(im)]
+
+        if not vector_datas:
+            return ActionResult(notifs=[Notif(
+                NotifType.ERROR,
+                name="NoData",
+                message=f"No vectors ({vector_name(vec_type)}) found. Compute vectors first.",
+            )])
+
+        tree = self.trees.get(vec_type)
+        if not tree:
+            return ActionResult(notifs=[Notif(
+                NotifType.ERROR, name="NoFaissTree",
+                message=f"No Faiss tree for {vector_name(vec_type)}",
+            )])
+
+        # cap the number of neighbours: querying the full tree (k defaults to
+        # 999999) returns every image in the dataset, which overwhelms the
+        # frontend on large collections (e.g. 500k instances).
+        # ask for a few extra to compensate for ignored (queried) sha1s.
+        k = max(1, max_results) + len(ignore_sha1s)
+        res = tree.query(vector_datas, k=k)
+        index = {r['sha1']: r['dist'] for r in res if r['sha1'] not in ignore_sha1s}
+        index = dict(list(index.items())[:max(1, max_results)])
+        res_sha1s = list(index.keys())
+        scores = ScoreList(min=0, max=1, values=[index[s] for s in res_sha1s],
+                           max_is_best=True, description="Cosine similarity (1 = identical)")
+        return ActionResult(groups=[Group(sha1s=res_sha1s, scores=scores)])
+
+    def search_by_text(self, context: ActionContext, vec_type: OwnVectorType,
+                       text: str = '', min_similarity: float = 0.5) -> ActionResult:
+        """Search images by text similarity.
+        @vec_type: vector space to search in
+        @text: search query or image URL
+        @min_similarity: minimum similarity threshold (0–1)
+        """
+        if not text:
+            return ActionResult(notifs=[Notif(
+                NotifType.ERROR, name="EmptySearchText",
+                message="Please provide a non-empty search text",
+            )])
+
+        context_instances = self._get_instances(context)
+        context_sha1s = {i.sha1 for i in context_instances}
+
+        tree = self.trees.get(vec_type)
+        if not tree:
+            return ActionResult(notifs=[Notif(
+                NotifType.ERROR, name="NoFaissTree",
+                message=f"No Faiss tree for {vector_name(vec_type)}",
+            )])
+
+        self._load_text_vectors(vec_type)
+        text_vectors = []
+        transformer = self.transformers.get(vec_type)
+
+        try:
+            max_text_sim = transformer.max_text_sim
+            if text in self.text_vectors[vec_type]:
+                resulting_images = tree.query([self.text_vectors[vec_type][text]])
+            elif is_image_url(text):
+                im = Image.open(requests.get(text, stream=True, timeout=30).raw)
+                vec = transformer.to_vector(im)
+                resulting_images = tree.query([vec])
+            else:
+                resulting_images, text_vectors = tree.query_texts([text], transformer, return_vec=True)
+        except ValueError as e:
+            return ActionResult(notifs=[Notif(NotifType.ERROR, name="TextSimilarityError", message=str(e))])
+
+        filtered = [inst for inst in resulting_images if inst['sha1'] in context_sha1s]
+        index = {r['sha1']: r['dist'] for r in filtered}
+        res_sha1s = np.asarray(list(index.keys()))
+        res_scores = np.asarray([index[sha1] for sha1 in res_sha1s])
+
+        remapped = np.around(np.interp(res_scores, [0, max_text_sim], [0, 1]), decimals=2)
+        mask = remapped >= min_similarity
+        final_sha1s = res_sha1s[mask].tolist()
+        final_scores = remapped[mask].tolist()
+
+        if self.params.save_text_searches and len(text_vectors) > 0:
+            self._save_text_vectors([text], text_vectors, vec_type)
+
+        group = Group(sha1s=final_sha1s,
+                      scores=ScoreList(min=0, max=1, values=final_scores,
+                                       description="Text-image similarity remapped to [0,1]"))
+        group.name = f"Text Search: {text}"
+        return ActionResult(groups=[group])
+
+    def cluster_by_tags(self, context: ActionContext, tags: PropertyId,
+                        vec_type: OwnVectorType, min_similarity: float = 0.5,
+                        parent_tags: ClusterByTagsEnum = ClusterByTagsEnum.use,
+                        multiple: bool = False, prefix: str = '') -> ActionResult:
+        """Cluster images guided by a Tag/MultiTag property.
+        @tags: the tag or multi-tag property to guide clustering
+        @vec_type: vector space to use
+        @min_similarity: minimum text-image similarity to include an image
+        @parent_tags: how to handle parent tag names
+        @multiple: allow an image to appear in multiple clusters
+        @prefix: prefix to prepend to each tag before embedding
+        """
+        props = self.project.get_properties(id=[int(tags)])
+        if not props:
+            return ActionResult(notifs=[Notif(
+                NotifType.ERROR, name="PropertyNotFound",
+                message=f"Property {tags} not found",
+            )])
+        tag_prop = props[0]
+        if tag_prop.dtype not in ('tag', 'multi_tags'):
+            return ActionResult(notifs=[Notif(
+                NotifType.ERROR, name="WrongPropertyType",
+                message=f"Property <{tag_prop.name}> is not a Tag or MultiTags property",
+            )])
+
+        instances = self._get_instances(context)
+        sha1_to_instance = group_by_sha1(instances)
+        sha1s = list(sha1_to_instance.keys())
+        if not sha1s:
+            return ActionResult()
+
+        all_tags = self.project.get_tags(list_id=tag_prop.tag_list_id)
+        tags_text = process_tags(all_tags, parent_tags=parent_tags)
+        if prefix:
+            tags_text = [prefix + t for t in tags_text]
+
+        transformer = self.transformers.get(vec_type)
+        if not transformer.can_handle_text:
+            return ActionResult(notifs=[Notif(
+                NotifType.ERROR, name="TextSimilarityError",
+                message=f"Model {transformer.name} does not support text similarity",
+            )])
+
+        texts_to_transform = []
+        text_vectors = []
+        self._load_text_vectors(vec_type)
+
+        for text in tags_text:
+            if text in self.text_vectors[vec_type]:
+                text_vectors.append(self.text_vectors[vec_type][text])
+            else:
+                texts_to_transform.append(text)
+
+        if texts_to_transform:
+            transformed = transformer.get_text_vectors(texts_to_transform)
+            text_vectors = [*transformed, *text_vectors]
+            self._save_text_vectors(texts_to_transform, transformed, vec_type)
+
+        pano_vectors = self.project.get_vectors(type_id=vec_type.id, sha1s=sha1s)
+        if not pano_vectors:
+            return ActionResult(notifs=[Notif(
+                NotifType.ERROR, name="NoData",
+                message=f"No vectors ({vector_name(vec_type)}) found. Compute vectors first.",
+            )])
+
+        groups = cluster_by_text(pano_vectors, text_vectors, tags_text, min_similarity,
+                                 transformer.max_text_sim, multiple)
+        return ActionResult(groups=groups)
+
+    # ------------------------------------------------------------------
+    # Dimensionality reduction / maps
+    # ------------------------------------------------------------------
+
+    def pacmap(self, ctx: ActionContext, vec_type: OwnVectorType, map_name: str = "") -> ActionResult:
+        """Compute a PaCMAP 2D map for the selected images.
+        @vec_type: vector space to reduce
+        @map_name: name for the saved map (auto-generated if empty)
+        """
+        instances = self._get_instances(ctx)
         sha1s = list({i.sha1 for i in instances})
-        vectors = await self.project.get_vectors(vec_type.id, sha1s=sha1s)
-        points = await self.project.run_async(self.get_pacmap_coordinates, vectors)
+        vectors = self.project.get_vectors(vec_type.id, sha1s=sha1s)
+        if len(vectors) < MIN_MAP_POINTS:
+            return ActionResult(notifs=[Notif(NotifType.ERROR, name="NoData",
+                message=f"Need at least {MIN_MAP_POINTS} vectors to compute a map (got {len(vectors)}).")])
+        points = self.project.run_in_executor(self._get_pacmap_coordinates, vectors)
+        return self._save_map(points, vec_type, map_name or f"pacmap: {vec_type.params['model']}")
 
-        values = []
-        for sha1 in points.keys():
-            values.append(sha1)
-            values.append(points[sha1][0])
-            values.append(points[sha1][1])
-
-        if map_name == "":
-            map_name = f"pacmap: {vec_type.params['model']}"
-        point_map = await self.project.create_map(name=map_name, key='sha1', data=values)
-        point_map.data = normalize_positions(point_map.data, 100)
-        point_map = await self.project.add_map(point_map)
-
-        return ActionResult(value=point_map)
-
-    async def tsne(self, ctx: ActionContext, vec_type: OwnVectorType, map_name: str = ""):
-        instances = await self.project.get_instances(ctx.instance_ids)
+    def tsne(self, ctx: ActionContext, vec_type: OwnVectorType, map_name: str = "") -> ActionResult:
+        """Compute a t-SNE 2D map for the selected images.
+        @vec_type: vector space to reduce
+        @map_name: name for the saved map (auto-generated if empty)
+        """
+        instances = self._get_instances(ctx)
         sha1s = list({i.sha1 for i in instances})
-        vectors = await self.project.get_vectors(vec_type.id, sha1s=sha1s)
-        points = await self.project.run_async(self.get_tsne_coordinates, vectors)
+        vectors = self.project.get_vectors(vec_type.id, sha1s=sha1s)
+        if len(vectors) < MIN_MAP_POINTS:
+            return ActionResult(notifs=[Notif(NotifType.ERROR, name="NoData",
+                message=f"Need at least {MIN_MAP_POINTS} vectors to compute a map (got {len(vectors)}).")])
+        points = self.project.run_in_executor(self._get_tsne_coordinates, vectors)
+        return self._save_map(points, vec_type, map_name or f"tsne: {vec_type.params['model']}")
 
-        values = []
-        for sha1 in points.keys():
-            values.append(sha1)
-            values.append(points[sha1][0])
-            values.append(points[sha1][1])
-
-        if map_name == "":
-            map_name = f"tsne: {vec_type.params['model']}"
-        point_map = await self.project.create_map(name=map_name, key='sha1', data=values)
-        point_map.data = normalize_positions(point_map.data, 100)
-        point_map = await self.project.add_map(point_map)
-
-        return ActionResult(value=point_map)
-
-    async def umap(self, ctx: ActionContext, vec_type: OwnVectorType, map_name: str = ""):
-        instances = await self.project.get_instances(ctx.instance_ids)
+    def umap(self, ctx: ActionContext, vec_type: OwnVectorType, map_name: str = "") -> ActionResult:
+        """Compute a UMAP 2D map for the selected images.
+        @vec_type: vector space to reduce
+        @map_name: name for the saved map (auto-generated if empty)
+        """
+        instances = self._get_instances(ctx)
         sha1s = list({i.sha1 for i in instances})
-        vectors = await self.project.get_vectors(vec_type.id, sha1s=sha1s)
-        points = await self.project.run_async(self.get_umap_coordinates, vectors)
+        vectors = self.project.get_vectors(vec_type.id, sha1s=sha1s)
+        if len(vectors) < MIN_MAP_POINTS:
+            return ActionResult(notifs=[Notif(NotifType.ERROR, name="NoData",
+                message=f"Need at least {MIN_MAP_POINTS} vectors to compute a map (got {len(vectors)}).")])
+        points = self.project.run_in_executor(self._get_umap_coordinates, vectors)
+        return self._save_map(points, vec_type, map_name or f"umap: {vec_type.params['model']}")
 
-        values = []
-        for sha1 in points.keys():
-            values.append(sha1)
-            values.append(points[sha1][0])
-            values.append(points[sha1][1])
-
-        if map_name == "":
-            map_name = f"umap: {vec_type.params['model']}"
-        point_map = await self.project.create_map(name=map_name, key='sha1', data=values)
-        point_map.data = normalize_positions(point_map.data, 100)
-        point_map = await self.project.add_map(point_map)
-
-        return ActionResult(value=point_map)
+    def _save_map(self, points: dict, vec_type: VectorType, name: str) -> ActionResult:
+        flat: list = []
+        for sha1, (x, y) in points.items():
+            flat += [sha1, x, y]
+        flat = normalize_positions(flat, 100)
+        point_map = self.project.upsert_map(Map(
+            id=-1, source=self.name, name=name,
+            key='sha1', count=len(points), data=flat,
+        ))
+        return ActionResult(value=msgspec.structs.asdict(point_map))
 
     @staticmethod
-    def get_pacmap_coordinates(vectors: list[Vector]):
+    def _get_pacmap_coordinates(vectors: list[Vector]) -> dict:
+        if len(vectors) < MIN_MAP_POINTS:
+            return {}
+        import pacmap  # imported lazily: ~0.7s of numba/sklearn setup
         data = np.asarray([v.data for v in vectors])
         embedding = pacmap.PaCMAP(n_components=2, n_neighbors=10, MN_ratio=0.5, FP_ratio=2.0)
-        pacmap_result = embedding.fit_transform(data, init="pca")
-        result_dict = {vectors[i].sha1: pacmap_result[i].tolist() for i in range(pacmap_result.shape[0])}
-        return result_dict
+        result = embedding.fit_transform(data, init="pca")
+        return {vectors[i].sha1: result[i].tolist() for i in range(result.shape[0])}
 
     @staticmethod
-    def get_tsne_coordinates(vectors: list[Vector]):
+    def _get_tsne_coordinates(vectors: list[Vector]) -> dict:
+        if len(vectors) < MIN_MAP_POINTS:
+            return {}
+        from sklearn.manifold import TSNE  # imported lazily
         data = np.asarray([v.data for v in vectors])
-
-        # Apply t-SNE
-        tsne = TSNE(n_components=2, perplexity=30, random_state=None)
-        tsne_result = tsne.fit_transform(data)
-
-        # Prepare the dictionary
-        result_dict = {vectors[i].sha1: tsne_result[i].tolist() for i in range(tsne_result.shape[0])}
-
-        return result_dict
+        # perplexity must stay below the number of samples
+        perplexity = min(30, len(vectors) - 1)
+        result = TSNE(n_components=2, perplexity=perplexity, random_state=None).fit_transform(data)
+        return {vectors[i].sha1: result[i].tolist() for i in range(result.shape[0])}
 
     @staticmethod
-    def get_umap_coordinates(vectors: list[Vector]):
-        """
-        Applique UMAP pour réduire les vecteurs en 2D et retourne un dictionnaire {sha1: coordonnées}
-        """
+    def _get_umap_coordinates(vectors: list[Vector]) -> dict:
+        if len(vectors) < MIN_MAP_POINTS:
+            return {}
+        import umap  # imported lazily: ~2.4s of pynndescent/numba JIT setup
         data = np.asarray([v.data for v in vectors])
+        result = umap.UMAP(n_components=2, random_state=None).fit_transform(data)
+        return {vectors[i].sha1: result[i].tolist() for i in range(result.shape[0])}
 
-        umap_reducer = umap.UMAP(n_components=2, random_state=None)
-        umap_result = umap_reducer.fit_transform(data)
+    # ------------------------------------------------------------------
+    # Text vector cache
+    # ------------------------------------------------------------------
 
-        result_dict = {vectors[i].sha1: umap_result[i].tolist() for i in range(umap_result.shape[0])}
-
-        return result_dict
-
-    async def rebuild_trees(self):
-        types = await self.project.get_vector_types(self.name)
-        for type_ in types:
-            await self.trees.rebuild_tree(type_)
-
-
-
-    def _save_text_vectors(self, texts, text_vectors: list[VectorType], vec_type: VectorType):
-        for text, text_vector in zip(texts, text_vectors):
-            self.text_vectors[vec_type][text] = text_vector
+    def _save_text_vectors(self, texts, text_vectors: list, vec_type: VectorType) -> None:
+        for text, vec in zip(texts, text_vectors):
+            self.text_vectors[vec_type][text] = vec
         with open(self.data_path / (str(vec_type) + '_text_vectors.pkl'), 'wb') as f:
             pickle.dump(self.text_vectors[vec_type], f)
 
-
-    def _load_text_vectors(self, vec_type: VectorType):
+    def _load_text_vectors(self, vec_type: VectorType) -> None:
         if self.text_vectors[vec_type]:
             return
         path = self.data_path / (str(vec_type) + '_text_vectors.pkl')
@@ -503,5 +595,11 @@ class PanopticML(APlugin):
             with open(path, 'rb') as f:
                 self.text_vectors[vec_type] = pickle.load(f)
 
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
-
+    def _get_instances(self, context: ActionContext) -> list:
+        if context.instance_ids:
+            return self.project.get_instances(id=context.instance_ids)
+        return self.project.get_instances()
