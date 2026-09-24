@@ -1,7 +1,8 @@
 name: Tests Multi-Plateformes
 
-# Déclenchement manuel uniquement
+# Lancé sur chaque PR (le check « Tests OK » doit être vert pour merger) ou à la main
 on:
+  pull_request:
   workflow_dispatch:
     inputs:
       os:
@@ -21,6 +22,10 @@ on:
         type: boolean
         default: false
 
+concurrency:
+  group: tests-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: "Tests sur ${{ matrix.os }} : ${{ matrix.python-version }}"
@@ -31,14 +36,16 @@ jobs:
       # Continue même si un OS échoue
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(inputs.os == 'all' && '["ubuntu-latest", "windows-latest", "macos-latest"]' || format('["{0}"]', inputs.os)) }}
+        # Sur une PR, inputs est vide : tous les OS
+        os: ${{ fromJSON((inputs.os || 'all') == 'all' && '["ubuntu-latest", "windows-latest", "macos-latest"]' || format('["{0}"]', inputs.os)) }}
         python-version: ['3.11', '3.12', '3.13']
 
     env:
       HF_HUB_DISABLE_PROGRESS_BARS: "1"
       # noms de ModelEnum ; "all" teste tout (~11 Go de modèles par job)
       PANOPTICML_TEST_MODELS: ${{ inputs.all-models && 'all' || 'clip,siglip,dinov3' }}
-      PANOPTIC_BRANCH: ${{ inputs.panoptic-branch }}
+      # Sur une PR : Panoptic main, tant que Panoptic 1.0 n'est pas sur PyPI
+      PANOPTIC_BRANCH: ${{ github.event_name == 'pull_request' && 'main' || inputs.panoptic-branch }}
       # Le GPU Metal virtualisé des runners macOS donne des vecteurs CLIP / SigLIP faux
       PANOPTICML_DEVICE: ${{ startsWith(matrix.os, 'macos') && 'cpu' || '' }}
 
@@ -87,3 +94,14 @@ jobs:
       timeout-minutes: 30
       with:
         limit-access-to-actor: true
+
+  # Check unique à déclarer comme obligatoire dans la protection de branche
+  tests-ok:
+    name: Tests OK
+    if: always()
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+    - name: Tous les jobs sont verts
+      if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+      run: exit 1
