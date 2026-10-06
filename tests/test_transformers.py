@@ -62,7 +62,7 @@ def generate_fast_vectors(transformer: Transformer, images=None):
     images = get_images() if not images else images
     arrays = []
     for img_path in images:
-        _, array = _preprocess_worker((img_path.name, img_path.read_bytes(), transformer.preprocess_size, False))
+        _, array, _ = _preprocess_worker((img_path.name, img_path.read_bytes(), transformer.preprocess_size, False))
         arrays.append(array)
     return list(transformer.forward_from_arrays(arrays)), images
 

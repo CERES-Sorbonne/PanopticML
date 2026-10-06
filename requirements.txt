@@ -1,6 +1,6 @@
 torch
 torchvision
-transformers>=4.56
+transformers>=5.19
 accelerate
 faiss-cpu<1.11.0
 scikit-learn

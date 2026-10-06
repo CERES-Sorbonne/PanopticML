@@ -22,6 +22,7 @@ Several models are available in this plugin to compute the embeddings:
 - [meta DINOv3](https://huggingface.co/docs/transformers/main/model_doc/dinov3): successor of DINOv2, stronger visual features, no support for text similarity
 - [NVIDIA C-RADIOv4](https://huggingface.co/nvidia/C-RADIOv4-H): heavy agglomerative vision model (512px input), GPU recommended, no support for text similarity
 - [apple MobileCLIP2](https://huggingface.co/apple/MobileCLIP2-S2): fast CLIP-like model (S2 or L-14), supports text similarity
+- [google EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2): multimodal embedding model (text, 100+ languages, images in one space), supports text similarity, GPU recommended (heavy on CPU)
 - auto transformers: want to tryout any huggingface multimodal model ? you can just provide its id to panopticML and should be able to use it directly
 
 ## Clustering functions

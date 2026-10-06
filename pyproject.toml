@@ -31,7 +31,7 @@ classifiers = [
 dependencies = [
     "torch",
     "torchvision",
-    "transformers>=4.56",  # DINOv3
+    "transformers>=5.19",  # EmbeddingGemma 2
     "accelerate",  # needed by transformers for device_map
     "faiss-cpu<1.11.0",
     "scikit-learn",

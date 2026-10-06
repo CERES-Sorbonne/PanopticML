@@ -50,11 +50,19 @@ def from_pretrained(loader, huggingface_model: str, **kwargs):
     1-4s per artefact even when the files are already on disk — several seconds of
     plugin startup for nothing. Try the cache first and only hit the network when the
     model really isn't there yet (first use of a model).
+
+    MPS models are loaded on the CPU, then moved: transformers 5 loads weights from
+    several threads, and concurrent dtype casts on MPS race inside torch's Metal kernel
+    cache (load hangs, or segfaults).
     """
+    to_mps = kwargs.get('device_map') == 'mps'
+    if to_mps:
+        kwargs['device_map'] = 'cpu'
     try:
-        return loader.from_pretrained(huggingface_model, local_files_only=True, **kwargs)
+        loaded = loader.from_pretrained(huggingface_model, local_files_only=True, **kwargs)
     except Exception:
-        return loader.from_pretrained(huggingface_model, **kwargs)
+        loaded = loader.from_pretrained(huggingface_model, **kwargs)
+    return loaded.to('mps') if to_mps else loaded
 
 
 def get_model_type(huggingface_model: str) -> str:
@@ -88,7 +96,8 @@ def get_transformer(huggingface_model: str) -> 'Transformer':
 # ---------------------------------------------------------------------------
 
 class Transformer:
-    # reduced precision used on CUDA; models whose activations overflow fp16 use bfloat16
+    # reduced precision used on CUDA (and on MPS when fp16); models whose activations
+    # overflow fp16 use bfloat16
     cuda_dtype = torch.float16
 
     def __init__(self, huggingface_model: str):
@@ -103,6 +112,10 @@ class Transformer:
         self.preprocess_size: int = 224  # overridden by subclasses
 
     def _resolve_dtype(self) -> torch.dtype:
+        if self.device == 'mps':
+            # Apple GPUs: fp16 is ~15-20% faster than fp32 with the same vectors (cosine
+            # > 0.9999 for CLIP / SigLIP). bf16 models stay in fp32: not validated on MPS.
+            return torch.float16 if self.cuda_dtype == torch.float16 else torch.float32
         if self.device != 'cuda':
             return torch.float32
         if self.cuda_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
@@ -507,6 +520,66 @@ class MobileClipTransformer(Transformer):
 
 
 # ---------------------------------------------------------------------------
+# Google EmbeddingGemma 2
+# ---------------------------------------------------------------------------
+
+class EmbeddingGemma2Transformer(Transformer):
+    """Google EmbeddingGemma 2 multimodal embedding model (needs transformers >= 5.19).
+    An image becomes ~280 soft tokens that run through the Gemma text model like a
+    prompt; the vector is the mean of the output tokens, so images and text queries
+    share one 768-d space.
+    See: https://huggingface.co/google/embeddinggemma-2
+    """
+    # fp16 overflows: NaN or degraded vectors (model card)
+    cuda_dtype = torch.bfloat16
+    max_text_sim = 0.75
+    # model-card task prefix for search queries; images take no prefix
+    query_prompt = "task: search result | query: "
+    # images per forward pass: each is a 2520-patch sequence for the vision tower, so
+    # memory grows fast (~0.25 GB per image on MPS) while throughput is flat beyond 8
+    max_batch = 8
+
+    def __init__(self, huggingface_model: str):
+        super().__init__(huggingface_model)
+        from transformers import AutoConfig, AutoModel, AutoProcessor
+        # skip the audio encoder: 300M of the 740M parameters, never used here
+        config = from_pretrained(AutoConfig, huggingface_model, audio_config=None)
+        self.model = from_pretrained(
+            AutoModel, huggingface_model, config=config, dtype=self.dtype, device_map=self.device
+        )
+        self.model.eval()
+        self.processor = from_pretrained(AutoProcessor, huggingface_model)
+        self.can_handle_text = True
+
+        # Variable resolution: the processor keeps the aspect ratio within a patch budget
+        # and patchifies itself, so arrays go through it too (base forward_from_arrays).
+        # Pre-resize to the largest square that fits the budget (768px), kept as is.
+        ip = self.processor.image_processor
+        side = ip.patch_size * ip.pooling_kernel_size
+        max_patches = ip.max_soft_tokens * ip.pooling_kernel_size ** 2
+        self.preprocess_size = math.isqrt(max_patches) * ip.patch_size // side * side
+
+    def _embed(self, inputs) -> np.ndarray:
+        inputs = self._to_device(inputs)
+        with torch.no_grad():
+            tokens = self.model(**inputs).last_hidden_state.float()
+        mask = inputs['attention_mask'].unsqueeze(-1).float()
+        return _l2_normalize((tokens * mask).sum(dim=1) / mask.sum(dim=1))
+
+    def to_vectors_batch(self, images) -> np.ndarray:
+        return np.concatenate([
+            # one nested list per image: each gets its own <|image|> prompt
+            self._embed(self.processor(images=[[image] for image in images[i:i + self.max_batch]],
+                                       return_tensors="pt"))
+            for i in range(0, len(images), self.max_batch)
+        ])
+
+    def to_text_vector(self, text: str) -> np.ndarray:
+        inputs = self.processor(text=[self.query_prompt + text], return_tensors="pt")
+        return self._embed(inputs)[0]
+
+
+# ---------------------------------------------------------------------------
 
 type_to_class_mapping = {
     "mobilenet_v2": MobileNetTransformer,
@@ -519,6 +592,7 @@ type_to_class_mapping = {
     "radio":        RadioTransformer,
     "mobileclip2":  MobileClipTransformer,
     "mobileclip":   MobileClipTransformer,
+    "embedding_gemma2": EmbeddingGemma2Transformer,
 }
 
 
