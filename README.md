@@ -25,6 +25,20 @@ Several models are available in this plugin to compute the embeddings:
 - [google EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2): multimodal embedding model (text, 100+ languages, images in one space), supports text similarity, GPU recommended (heavy on CPU)
 - auto transformers: want to tryout any huggingface multimodal model ? you can just provide its id to panopticML and should be able to use it directly
 
+## Apple Silicon
+
+On Apple Silicon Macs, embeddings are computed on the GPU (MPS) in reduced precision, and three models get extra compute engines:
+- CLIP: the Neural Engine runs next to the GPU, ~1.9x faster (M4 Pro: ~1150 images/s instead of ~600)
+- SIGLIP2: the Neural Engine runs next to the GPU, ~2.3x faster (M4 Pro: ~65 images/s instead of ~28)
+- EmbeddingGemma 2: MLX runs the vision tower on the GPU (~2x faster than PyTorch), and the Neural Engine runs next to it, ~3x faster overall (M4 Pro: ~8 images/s instead of ~2.5)
+
+The first time a model is used, it is converted for the Neural Engine in the background (one to three minutes, the GPU computes meanwhile) and cached in `~/.cache/panopticml`. Neural Engine vectors are computed in fp16, slightly less precise than the GPU's (cosine 0.97 to 0.9998 to the full-precision vector on photos, against more than 0.9998 on the GPU). Search quality is unchanged: on Flickr30k (1000 photos, 5000 captions), text-to-image and image-to-text recall with the Neural Engine is within 0.5 point of the GPU's for all three models. Turn the `neural_engine` plugin setting off to compute on the GPU only.
+
+Environment variables:
+- `PANOPTICML_DEVICE`: force the PyTorch device (`cpu`, `cuda`, `mps`)
+- `PANOPTICML_ANE=0`, `PANOPTICML_MLX=0`: never use the Neural Engine / MLX
+- `PANOPTICML_CACHE`: where converted Core ML models are stored (default `~/.cache/panopticml`)
+
 ## Clustering functions
 - Kmeans: specify a number of clusters, really fast
 - HDBScan: automatic number of clusters, a bit slower and excludes a lot of images

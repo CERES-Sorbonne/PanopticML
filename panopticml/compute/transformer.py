@@ -1,3 +1,4 @@
+import functools
 import gc
 import math
 import threading
@@ -99,6 +100,11 @@ class Transformer:
     # reduced precision used on CUDA (and on MPS when fp16); models whose activations
     # overflow fp16 use bfloat16
     cuda_dtype = torch.float16
+    # precision on Apple GPUs, when validated for the model; None: fp16 if cuda_dtype is
+    # fp16, else fp32
+    mps_dtype: torch.dtype | None = None
+    # images per GPU forward pass; None: chosen from the model's size (see batch_size)
+    preferred_batch: int | None = None
     # cosine of an unrelated text/image pair: remapped to a 0 score
     min_text_sim = 0.0
 
@@ -112,17 +118,37 @@ class Transformer:
         self.can_handle_text = False
         self.name = huggingface_model
         self.preprocess_size: int = 224  # overridden by subclasses
+        # serializes torch work on the device when several compute engines share the model
+        self.device_lock = threading.RLock()
+        # extra compute engines (Neural Engine, MLX), built on first use: see compute/accel
+        self.engines = None
 
     def _resolve_dtype(self) -> torch.dtype:
         if self.device == 'mps':
+            if self.mps_dtype == torch.bfloat16 and not torch.backends.mps.is_macos_or_newer(14, 0):
+                return torch.float32
+            if self.mps_dtype is not None:
+                return self.mps_dtype
             # Apple GPUs: fp16 is ~15-20% faster than fp32 with the same vectors (cosine
-            # > 0.9999 for CLIP / SigLIP). bf16 models stay in fp32: not validated on MPS.
+            # > 0.9999 for CLIP / SigLIP). bf16 models stay in fp32 unless validated.
             return torch.float16 if self.cuda_dtype == torch.float16 else torch.float32
         if self.device != 'cuda':
             return torch.float32
         if self.cuda_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
             return torch.float32  # pre-Ampere GPUs: fp16 would overflow, stay in full precision
         return self.cuda_dtype
+
+    @functools.cached_property
+    def batch_size(self) -> int:
+        """Images per GPU forward pass. On Apple GPUs light models keep gaining up to 128
+        (CLIP B/32: 445 img/s at 8, 636 at 128), while heavy ones (SigLIP so400m,
+        MobileCLIP2-L) are flat from 8 to 32 and only use more memory beyond."""
+        if self.preferred_batch:
+            return self.preferred_batch
+        n_params = sum(p.numel() for p in self.model.parameters()) if isinstance(self.model, torch.nn.Module) else 0
+        if n_params >= 300e6 or self.preprocess_size >= 256:
+            return 32 if self.device == 'cuda' else 16
+        return 128
 
     @property
     def max_text_sim(self) -> float:
@@ -534,13 +560,17 @@ class EmbeddingGemma2Transformer(Transformer):
     """
     # fp16 overflows: NaN or degraded vectors (model card)
     cuda_dtype = torch.bfloat16
+    # bf16 on Apple GPUs: as fast as fp16 (1.5x fp32), with fp32's range
+    mps_dtype = torch.bfloat16
     # mean-pooled vectors share a large common component: unrelated pairs already
     # score ~0.55-0.63, good matches ~0.70-0.77
     min_text_sim = 0.55
     max_text_sim = 0.78
     # model-card task prefix for search queries; images take no prefix
     query_prompt = "task: search result | query: "
-    max_batch = 8
+    # images per forward pass: each is a 2304-patch sequence for the vision tower, so
+    # memory grows fast (~0.25 GB per image on MPS) while throughput is flat beyond 8
+    preferred_batch = 8
 
     def __init__(self, huggingface_model: str):
         super().__init__(huggingface_model)
@@ -563,23 +593,81 @@ class EmbeddingGemma2Transformer(Transformer):
         self.preprocess_size = math.isqrt(max_patches) * ip.patch_size // side * side
 
     def _embed(self, inputs) -> np.ndarray:
-        inputs = self._to_device(inputs)
-        with torch.no_grad():
+        with self.device_lock, torch.no_grad():   # the MLX engine shares the text model
+            inputs = self._to_device(inputs)
             tokens = self.model(**inputs).last_hidden_state.float()
         mask = inputs['attention_mask'].unsqueeze(-1).float()
         return _l2_normalize((tokens * mask).sum(dim=1) / mask.sum(dim=1))
 
+    @staticmethod
+    def _trim_padding(inputs):
+        """The processor pads every image to the full patch budget (2520), but a square 768px
+        image has 2304 patches: the vision tower would run on the padding too, under an
+        attention mask. When all images share one patch grid, drop the padding: same
+        vectors, ~18% faster."""
+        pos = inputs['image_position_ids']
+        valid = (pos != -1).all(dim=-1)
+        n = int(valid[0].sum())
+        if bool((valid.sum(dim=1) == n).all()) and bool(valid[:, :n].all()):
+            inputs['pixel_values'] = inputs['pixel_values'][:, :n]
+            inputs['image_position_ids'] = pos[:, :n]
+        return inputs
+
     def to_vectors_batch(self, images) -> np.ndarray:
         return np.concatenate([
             # one nested list per image: each gets its own <|image|> prompt
-            self._embed(self.processor(images=[[image] for image in images[i:i + self.max_batch]],
-                                       return_tensors="pt"))
-            for i in range(0, len(images), self.max_batch)
+            self._embed(self._trim_padding(self.processor(
+                images=[[image] for image in images[i:i + self.batch_size]], return_tensors="pt")))
+            for i in range(0, len(images), self.batch_size)
         ])
+
+    def forward_from_arrays(self, arrays: list[np.ndarray]) -> np.ndarray:
+        return self.to_vectors_batch(arrays)   # the processor patchifies uint8 arrays as is
 
     def to_text_vector(self, text: str) -> np.ndarray:
         inputs = self.processor(text=[self.query_prompt + text], return_tensors="pt")
         return self._embed(inputs)[0]
+
+    # -- split pipeline, for the MLX / Neural Engine compute engines -----------------------
+
+    def image_patches(self, arrays: list[np.ndarray]) -> np.ndarray:
+        """Preprocessed (B, P, 3*p*p) patches of preresized arrays, padding removed."""
+        from .accel.ane_models import gemma_patches
+        return gemma_patches(self.processor, arrays)[0].numpy()
+
+    @functools.cached_property
+    def vision_tables(self) -> dict:
+        """Position embeddings, RoPE and pooling tables of the preprocess_size patch grid."""
+        from .accel.ane_models import gemma_patches, gemma_tables
+        blank = np.zeros((self.preprocess_size, self.preprocess_size, 3), dtype=np.uint8)
+        _, position_ids, _ = gemma_patches(self.processor, [blank])
+        return gemma_tables(self.model.vision_tower, position_ids)
+
+    @functools.cached_property
+    def _image_prompt(self) -> tuple[torch.Tensor, int]:
+        """Text-model input embeddings of a one-image prompt, and where its image tokens start."""
+        blank = np.zeros((self.preprocess_size, self.preprocess_size, 3), dtype=np.uint8)
+        ids = self.processor(images=[[blank]], return_tensors="pt")['input_ids'][0]
+        is_image = ids == self.model.config.image_token_id
+        start, n = int(is_image.nonzero()[0]), int(is_image.sum())
+        assert bool(is_image[start:start + n].all()), "image tokens are not contiguous"
+        ids = torch.where(is_image, self.model.config.text_config.pad_token_id, ids)
+        with torch.no_grad():
+            embeds = self.model.get_input_embeddings()(ids[None].to(self.device))
+        return embeds, start
+
+    def soft_tokens_to_vectors(self, soft: np.ndarray) -> np.ndarray:
+        """Image vectors from the vision tower's (B, T, D) soft tokens: the text-model half
+        of the forward pass, on the one-image prompt (same vectors as `forward`)."""
+        prompt, start = self._image_prompt
+        with self.device_lock, torch.no_grad():
+            soft = torch.from_numpy(np.ascontiguousarray(soft)).to(self.device, self.dtype)
+            B, T = soft.shape[:2]
+            embeds = torch.cat((prompt[:, :start].expand(B, -1, -1), soft,
+                                prompt[:, start + T:].expand(B, -1, -1)), dim=1)
+            mask = torch.ones(embeds.shape[:2], dtype=torch.long, device=self.device)
+            tokens = self.model.language_model(inputs_embeds=embeds, attention_mask=mask).last_hidden_state
+            return _l2_normalize(tokens.float().mean(dim=1))
 
 
 # ---------------------------------------------------------------------------
@@ -616,7 +704,10 @@ class TransformerManager:
 
     def clear(self) -> None:
         """Drop every loaded model and hand the freed memory back to the GPU."""
+        from .accel import close_engines
         with self._lock:
+            for transformer in self.transformers.values():
+                close_engines(transformer)
             self.transformers.clear()
         gc.collect()
         if torch.cuda.is_available():

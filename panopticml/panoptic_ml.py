@@ -43,6 +43,9 @@ MIN_MAP_POINTS = 4
 class PluginParams(BaseModel):
     compute_on_import: bool = True
     save_text_searches: bool = False
+    # Apple Silicon: also compute CLIP / SigLIP / EmbeddingGemma vectors on the Neural Engine, next
+    # to the GPU (~2-3x faster; its fp16 vectors are slightly less precise)
+    neural_engine: bool = True
 
 
 class ModelEnum(Enum):
