@@ -145,8 +145,12 @@ def test_apple_libraries_only_on_apple_silicon(source, name):
 def test_apple_libraries_skipped_where_no_wheel_exists(source):
     reqs = source()
     # MLX has wheels for macOS 14+ (Darwin 23+) only, and no source distribution
-    assert not reqs['mlx'].marker.evaluate(_env('darwin', 'arm64', '22.6.0', '3.12'))
-    assert reqs['mlx'].marker.evaluate(_env('darwin', 'arm64', '23.0.0', '3.12'))
+    for release in ('20.6.0', '21.6.0', '22.6.0'):
+        assert not reqs['mlx'].marker.evaluate(_env('darwin', 'arm64', release, '3.12'))
+    for release in ('23.0.0', '24.6.0', '25.0.0'):
+        assert reqs['mlx'].marker.evaluate(_env('darwin', 'arm64', release, '3.12'))
+    # markers are not short-circuited: a platform_release version comparison crashes on e.g. Fedora kernels
+    assert not reqs['mlx'].marker.evaluate(_env('linux', 'x86_64', '7.2.5-100.fc43.x86_64', '3.12'))
     # coremltools 9 has no Python 3.14 wheel: a source build would fail the install
     assert not reqs['coremltools'].marker.evaluate(_env('darwin', 'arm64', '24.6.0', '3.14'))
 

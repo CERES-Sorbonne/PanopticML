@@ -47,7 +47,7 @@ dependencies = [
     # coremltools ships no Python 3.14 wheel, MLX none before macOS 14 (Darwin 23): skipped
     # there, a source build would fail the whole install.
     "coremltools; sys_platform == 'darwin' and platform_machine == 'arm64' and python_version < '3.14'",
-    "mlx; sys_platform == 'darwin' and platform_machine == 'arm64' and platform_release >= '23'",
+    "mlx; sys_platform == 'darwin' and platform_machine == 'arm64' and '20.' not in platform_release and '21.' not in platform_release and '22.' not in platform_release",
 ]
 
 
