@@ -1,3 +1,4 @@
+import functools
 import gc
 import math
 import threading
@@ -50,11 +51,19 @@ def from_pretrained(loader, huggingface_model: str, **kwargs):
     1-4s per artefact even when the files are already on disk — several seconds of
     plugin startup for nothing. Try the cache first and only hit the network when the
     model really isn't there yet (first use of a model).
+
+    MPS models are loaded on the CPU, then moved: transformers 5 loads weights from
+    several threads, and concurrent dtype casts on MPS race inside torch's Metal kernel
+    cache (load hangs, or segfaults).
     """
+    to_mps = kwargs.get('device_map') == 'mps'
+    if to_mps:
+        kwargs['device_map'] = 'cpu'
     try:
-        return loader.from_pretrained(huggingface_model, local_files_only=True, **kwargs)
+        loaded = loader.from_pretrained(huggingface_model, local_files_only=True, **kwargs)
     except Exception:
-        return loader.from_pretrained(huggingface_model, **kwargs)
+        loaded = loader.from_pretrained(huggingface_model, **kwargs)
+    return loaded.to('mps') if to_mps else loaded
 
 
 def get_model_type(huggingface_model: str) -> str:
@@ -88,8 +97,14 @@ def get_transformer(huggingface_model: str) -> 'Transformer':
 # ---------------------------------------------------------------------------
 
 class Transformer:
-    # reduced precision used on CUDA; models whose activations overflow fp16 use bfloat16
+    # reduced precision used on CUDA (and on MPS when fp16); models whose activations
+    # overflow fp16 use bfloat16
     cuda_dtype = torch.float16
+    # precision on Apple GPUs, when validated for the model; None: fp16 if cuda_dtype is
+    # fp16, else fp32
+    mps_dtype: torch.dtype | None = None
+    # images per GPU forward pass; None: chosen from the model's size (see batch_size)
+    preferred_batch: int | None = None
 
     def __init__(self, huggingface_model: str):
         from transformers import logging
@@ -101,13 +116,37 @@ class Transformer:
         self.can_handle_text = False
         self.name = huggingface_model
         self.preprocess_size: int = 224  # overridden by subclasses
+        # serializes torch work on the device when several compute engines share the model
+        self.device_lock = threading.RLock()
+        # extra compute engines (Neural Engine, MLX), built on first use: see compute/accel
+        self.engines = None
 
     def _resolve_dtype(self) -> torch.dtype:
+        if self.device == 'mps':
+            if self.mps_dtype == torch.bfloat16 and not torch.backends.mps.is_macos_or_newer(14, 0):
+                return torch.float32
+            if self.mps_dtype is not None:
+                return self.mps_dtype
+            # Apple GPUs: fp16 is ~15-20% faster than fp32 with the same vectors (cosine
+            # > 0.9999 for CLIP / SigLIP). bf16 models stay in fp32 unless validated.
+            return torch.float16 if self.cuda_dtype == torch.float16 else torch.float32
         if self.device != 'cuda':
             return torch.float32
         if self.cuda_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
             return torch.float32  # pre-Ampere GPUs: fp16 would overflow, stay in full precision
         return self.cuda_dtype
+
+    @functools.cached_property
+    def batch_size(self) -> int:
+        """Images per GPU forward pass. On Apple GPUs light models keep gaining up to 128
+        (CLIP B/32: 445 img/s at 8, 636 at 128), while heavy ones (SigLIP so400m,
+        MobileCLIP2-L) are flat from 8 to 32 and only use more memory beyond."""
+        if self.preferred_batch:
+            return self.preferred_batch
+        n_params = sum(p.numel() for p in self.model.parameters()) if isinstance(self.model, torch.nn.Module) else 0
+        if n_params >= 300e6 or self.preprocess_size >= 256:
+            return 32 if self.device == 'cuda' else 16
+        return 128
 
     @property
     def max_text_sim(self) -> float:
@@ -170,7 +209,7 @@ class AutoTransformer(Transformer):
 
         # trust_remote_code: custom vector types can name any HuggingFace model
         self.model = from_pretrained(
-            AutoModel, huggingface_model, torch_dtype=self.dtype, device_map=self.device,
+            AutoModel, huggingface_model, dtype=self.dtype, device_map=self.device,
             trust_remote_code=True,
         )
         self.model.eval()
@@ -230,7 +269,7 @@ class MobileNetTransformer(Transformer):
         super().__init__(huggingface_model)
         from transformers import MobileNetV2Model, AutoImageProcessor
         self.model = from_pretrained(
-            MobileNetV2Model, huggingface_model, torch_dtype=self.dtype, device_map=self.device
+            MobileNetV2Model, huggingface_model, dtype=self.dtype, device_map=self.device
         )
         self.model.eval()
         self.processor = from_pretrained(AutoImageProcessor, huggingface_model)
@@ -273,7 +312,7 @@ class Dinov2Transformer(Transformer):
         super().__init__(huggingface_model)
         from transformers import AutoModel, AutoImageProcessor
         self.model = from_pretrained(
-            AutoModel, huggingface_model, torch_dtype=self.dtype, device_map=self.device
+            AutoModel, huggingface_model, dtype=self.dtype, device_map=self.device
         )
         self.model.eval()
         self.processor = from_pretrained(AutoImageProcessor, huggingface_model, use_fast=True)
@@ -507,6 +546,126 @@ class MobileClipTransformer(Transformer):
 
 
 # ---------------------------------------------------------------------------
+# Google EmbeddingGemma 2
+# ---------------------------------------------------------------------------
+
+class EmbeddingGemma2Transformer(Transformer):
+    """Google EmbeddingGemma 2 multimodal embedding model (needs transformers >= 5.19).
+    An image becomes ~280 soft tokens that run through the Gemma text model like a
+    prompt; the vector is the mean of the output tokens, so images and text queries
+    share one 768-d space.
+    See: https://huggingface.co/google/embeddinggemma-2
+    """
+    # fp16 overflows: NaN or degraded vectors (model card)
+    cuda_dtype = torch.bfloat16
+    # bf16 on Apple GPUs: as fast as fp16 (1.5x fp32), with fp32's range
+    mps_dtype = torch.bfloat16
+    max_text_sim = 0.75
+    # model-card task prefix for search queries; images take no prefix
+    query_prompt = "task: search result | query: "
+    # images per forward pass: each is a 2304-patch sequence for the vision tower, so
+    # memory grows fast (~0.25 GB per image on MPS) while throughput is flat beyond 8
+    preferred_batch = 8
+
+    def __init__(self, huggingface_model: str):
+        super().__init__(huggingface_model)
+        from transformers import AutoConfig, AutoModel, AutoProcessor
+        # skip the audio encoder: 300M of the 740M parameters, never used here
+        config = from_pretrained(AutoConfig, huggingface_model, audio_config=None)
+        self.model = from_pretrained(
+            AutoModel, huggingface_model, config=config, dtype=self.dtype, device_map=self.device
+        )
+        self.model.eval()
+        self.processor = from_pretrained(AutoProcessor, huggingface_model)
+        self.can_handle_text = True
+
+        # Variable resolution: the processor keeps the aspect ratio within a patch budget
+        # and patchifies itself, so arrays go through it too (base forward_from_arrays).
+        # Pre-resize to the largest square that fits the budget (768px), kept as is.
+        ip = self.processor.image_processor
+        side = ip.patch_size * ip.pooling_kernel_size
+        max_patches = ip.max_soft_tokens * ip.pooling_kernel_size ** 2
+        self.preprocess_size = math.isqrt(max_patches) * ip.patch_size // side * side
+
+    def _embed(self, inputs) -> np.ndarray:
+        with self.device_lock, torch.no_grad():   # the MLX engine shares the text model
+            inputs = self._to_device(inputs)
+            tokens = self.model(**inputs).last_hidden_state.float()
+        mask = inputs['attention_mask'].unsqueeze(-1).float()
+        return _l2_normalize((tokens * mask).sum(dim=1) / mask.sum(dim=1))
+
+    @staticmethod
+    def _trim_padding(inputs):
+        """The processor pads every image to the full patch budget (2520), but a square 768px
+        image has 2304 patches: the vision tower would run on the padding too, under an
+        attention mask. When all images share one patch grid, drop the padding: same
+        vectors, ~18% faster."""
+        pos = inputs['image_position_ids']
+        valid = (pos != -1).all(dim=-1)
+        n = int(valid[0].sum())
+        if bool((valid.sum(dim=1) == n).all()) and bool(valid[:, :n].all()):
+            inputs['pixel_values'] = inputs['pixel_values'][:, :n]
+            inputs['image_position_ids'] = pos[:, :n]
+        return inputs
+
+    def to_vectors_batch(self, images) -> np.ndarray:
+        return np.concatenate([
+            # one nested list per image: each gets its own <|image|> prompt
+            self._embed(self._trim_padding(self.processor(
+                images=[[image] for image in images[i:i + self.batch_size]], return_tensors="pt")))
+            for i in range(0, len(images), self.batch_size)
+        ])
+
+    def forward_from_arrays(self, arrays: list[np.ndarray]) -> np.ndarray:
+        return self.to_vectors_batch(arrays)   # the processor patchifies uint8 arrays as is
+
+    def to_text_vector(self, text: str) -> np.ndarray:
+        inputs = self.processor(text=[self.query_prompt + text], return_tensors="pt")
+        return self._embed(inputs)[0]
+
+    # -- split pipeline, for the MLX / Neural Engine compute engines -----------------------
+
+    def image_patches(self, arrays: list[np.ndarray]) -> np.ndarray:
+        """Preprocessed (B, P, 3*p*p) patches of preresized arrays, padding removed."""
+        from .accel.ane_models import gemma_patches
+        return gemma_patches(self.processor, arrays)[0].numpy()
+
+    @functools.cached_property
+    def vision_tables(self) -> dict:
+        """Position embeddings, RoPE and pooling tables of the preprocess_size patch grid."""
+        from .accel.ane_models import gemma_patches, gemma_tables
+        blank = np.zeros((self.preprocess_size, self.preprocess_size, 3), dtype=np.uint8)
+        _, position_ids, _ = gemma_patches(self.processor, [blank])
+        return gemma_tables(self.model.vision_tower, position_ids)
+
+    @functools.cached_property
+    def _image_prompt(self) -> tuple[torch.Tensor, int]:
+        """Text-model input embeddings of a one-image prompt, and where its image tokens start."""
+        blank = np.zeros((self.preprocess_size, self.preprocess_size, 3), dtype=np.uint8)
+        ids = self.processor(images=[[blank]], return_tensors="pt")['input_ids'][0]
+        is_image = ids == self.model.config.image_token_id
+        start, n = int(is_image.nonzero()[0]), int(is_image.sum())
+        assert bool(is_image[start:start + n].all()), "image tokens are not contiguous"
+        ids = torch.where(is_image, self.model.config.text_config.pad_token_id, ids)
+        with torch.no_grad():
+            embeds = self.model.get_input_embeddings()(ids[None].to(self.device))
+        return embeds, start
+
+    def soft_tokens_to_vectors(self, soft: np.ndarray) -> np.ndarray:
+        """Image vectors from the vision tower's (B, T, D) soft tokens: the text-model half
+        of the forward pass, on the one-image prompt (same vectors as `forward`)."""
+        prompt, start = self._image_prompt
+        with self.device_lock, torch.no_grad():
+            soft = torch.from_numpy(np.ascontiguousarray(soft)).to(self.device, self.dtype)
+            B, T = soft.shape[:2]
+            embeds = torch.cat((prompt[:, :start].expand(B, -1, -1), soft,
+                                prompt[:, start + T:].expand(B, -1, -1)), dim=1)
+            mask = torch.ones(embeds.shape[:2], dtype=torch.long, device=self.device)
+            tokens = self.model.language_model(inputs_embeds=embeds, attention_mask=mask).last_hidden_state
+            return _l2_normalize(tokens.float().mean(dim=1))
+
+
+# ---------------------------------------------------------------------------
 
 type_to_class_mapping = {
     "mobilenet_v2": MobileNetTransformer,
@@ -519,6 +678,7 @@ type_to_class_mapping = {
     "radio":        RadioTransformer,
     "mobileclip2":  MobileClipTransformer,
     "mobileclip":   MobileClipTransformer,
+    "embedding_gemma2": EmbeddingGemma2Transformer,
 }
 
 
@@ -539,7 +699,10 @@ class TransformerManager:
 
     def clear(self) -> None:
         """Drop every loaded model and hand the freed memory back to the GPU."""
+        from .accel import close_engines
         with self._lock:
+            for transformer in self.transformers.values():
+                close_engines(transformer)
             self.transformers.clear()
         gc.collect()
         if torch.cuda.is_available():

@@ -31,7 +31,7 @@ classifiers = [
 dependencies = [
     "torch",
     "torchvision",
-    "transformers>=4.56",  # DINOv3
+    "transformers>=5.19",
     "accelerate",  # needed by transformers for device_map
     "faiss-cpu<1.11.0",
     "scikit-learn",
@@ -43,6 +43,11 @@ dependencies = [
     "timm",  # C-RADIO, MobileCLIP
     "einops",  # C-RADIO
     "open-clip-torch",  # MobileCLIP
+    # Apple Silicon compute engines, see compute/accel; without them PyTorch computes alone.
+    # coremltools ships no Python 3.14 wheel, MLX none before macOS 14 (Darwin 23): skipped
+    # there, a source build would fail the whole install.
+    "coremltools; sys_platform == 'darwin' and platform_machine == 'arm64' and python_version < '3.14'",
+    "mlx; sys_platform == 'darwin' and platform_machine == 'arm64' and platform_release >= '23'",
 ]
 
 

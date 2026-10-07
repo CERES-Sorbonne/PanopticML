@@ -1,6 +1,6 @@
 torch
 torchvision
-transformers>=4.56
+transformers>=5.19
 accelerate
 faiss-cpu<1.11.0
 scikit-learn
@@ -12,3 +12,5 @@ pacmap
 timm
 einops
 open-clip-torch
+coremltools; sys_platform == "darwin" and platform_machine == "arm64" and python_version < "3.14"
+mlx; sys_platform == "darwin" and platform_machine == "arm64" and platform_release >= "23"

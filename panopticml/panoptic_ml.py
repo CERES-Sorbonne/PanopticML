@@ -43,6 +43,9 @@ MIN_MAP_POINTS = 4
 class PluginParams(BaseModel):
     compute_on_import: bool = True
     save_text_searches: bool = False
+    # Apple Silicon: also compute CLIP / SigLIP / EmbeddingGemma vectors on the Neural Engine, next
+    # to the GPU (~2-3x faster; its fp16 vectors are slightly less precise)
+    neural_engine: bool = True
 
 
 class ModelEnum(Enum):
@@ -54,6 +57,7 @@ class ModelEnum(Enum):
     radio = "nvidia/C-RADIOv4-H"
     mobileclip_s2 = "apple/MobileCLIP2-S2"
     mobileclip_l14 = "apple/MobileCLIP2-L-14"
+    embeddinggemma2 = "google/embeddinggemma-2"
 
 
 def vector_name(vec_type: VectorType) -> str:
@@ -161,18 +165,14 @@ class PanopticML(APlugin):
         @vec_type: the vector space to compute into
         """
         instances = self._get_instances(context)
-        self._enqueue_vectors_task(instances, vec_type)
-        return ActionResult(notifs=[Notif(
-            type=NotifType.INFO,
-            name="ComputeVector",
-            message=f"Started computing vectors {vector_name(vec_type)} for {len(instances)} images",
-        )])
+        task = self._enqueue_vectors_task(instances, vec_type)
+        return ActionResult(task_id=task.id if task else None)
 
-    def _enqueue_vectors_task(self, instances: list, vec_type: VectorType) -> None:
+    def _enqueue_vectors_task(self, instances: list, vec_type: VectorType) -> ComputeVectorsTask | None:
         if not instances:
-            return
+            return None
         task = ComputeVectorsTask(self, vec_type, instances)
-        self.project.add_task(task)
+        return self.project.add_task(task)
 
     def rebuild_index(self, vec_type: VectorType) -> None:
         self.trees.rebuild_tree(vec_type)
