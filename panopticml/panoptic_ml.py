@@ -391,7 +391,7 @@ class PanopticML(APlugin):
         transformer = self.transformers.get(vec_type)
 
         try:
-            max_text_sim = transformer.max_text_sim
+            text_sim_range = [transformer.min_text_sim, transformer.max_text_sim]
             if text in self.text_vectors[vec_type]:
                 resulting_images = tree.query([self.text_vectors[vec_type][text]])
             elif is_image_url(text):
@@ -408,7 +408,7 @@ class PanopticML(APlugin):
         res_sha1s = np.asarray(list(index.keys()))
         res_scores = np.asarray([index[sha1] for sha1 in res_sha1s])
 
-        remapped = np.around(np.interp(res_scores, [0, max_text_sim], [0, 1]), decimals=2)
+        remapped = np.around(np.interp(res_scores, text_sim_range, [0, 1]), decimals=2)
         mask = remapped >= min_similarity
         final_sha1s = res_sha1s[mask].tolist()
         final_scores = remapped[mask].tolist()
@@ -488,7 +488,7 @@ class PanopticML(APlugin):
             )])
 
         groups = cluster_by_text(pano_vectors, text_vectors, tags_text, min_similarity,
-                                 transformer.max_text_sim, multiple)
+                                 [transformer.min_text_sim, transformer.max_text_sim], multiple)
         return ActionResult(groups=groups)
 
     # ------------------------------------------------------------------

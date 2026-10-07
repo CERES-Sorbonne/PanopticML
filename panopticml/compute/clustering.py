@@ -78,14 +78,14 @@ def _make_clusters_faiss(vectors, nb_clusters=6, **kwargs) -> (np.ndarray, np.nd
 
 
 def cluster_by_text(image_vectors: list[Vector], text_vectors: list[np.array], text_labels: list[str],
-                    min_similarity: float, max_text_sim: float, multiple: bool) -> list[Group]:
+                    min_similarity: float, text_sim_range: list[float], multiple: bool) -> list[Group]:
     vectors, sha1s = zip(*[(i.data, i.sha1) for i in image_vectors])
     sha1s_array = np.asarray(sha1s)
 
     if not multiple:
         similarities, closest_text_indices = similarity_matrix(vectors, text_vectors, multiple=False)
         similarities = torch.from_numpy(
-            np.around(np.interp(similarities.numpy(), [0, max_text_sim], [0, 1]), decimals=2)
+            np.around(np.interp(similarities.numpy(), text_sim_range, [0, 1]), decimals=2)
         )
         mask = similarities >= min_similarity
         filtered_similarities = similarities[mask]
@@ -129,7 +129,7 @@ def cluster_by_text(image_vectors: list[Vector], text_vectors: list[np.array], t
     else:
         similarity_matrix_full = similarity_matrix(vectors, text_vectors, multiple=True)
         similarity_matrix_remapped = torch.from_numpy(
-            np.around(np.interp(similarity_matrix_full.numpy(), [0, max_text_sim], [0, 1]), decimals=2)
+            np.around(np.interp(similarity_matrix_full.numpy(), text_sim_range, [0, 1]), decimals=2)
         )
 
         groups = []

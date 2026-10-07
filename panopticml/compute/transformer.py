@@ -99,6 +99,8 @@ class Transformer:
     # reduced precision used on CUDA (and on MPS when fp16); models whose activations
     # overflow fp16 use bfloat16
     cuda_dtype = torch.float16
+    # cosine of an unrelated text/image pair: remapped to a 0 score
+    min_text_sim = 0.0
 
     def __init__(self, huggingface_model: str):
         from transformers import logging
@@ -274,7 +276,7 @@ class CLIPTransformer(AutoTransformer):
 
 
 class SIGLIPTransformer(AutoTransformer):
-    max_text_sim = 0.20
+    max_text_sim = 0.17
 
 
 # ---------------------------------------------------------------------------
@@ -532,11 +534,12 @@ class EmbeddingGemma2Transformer(Transformer):
     """
     # fp16 overflows: NaN or degraded vectors (model card)
     cuda_dtype = torch.bfloat16
-    max_text_sim = 0.75
+    # mean-pooled vectors share a large common component: unrelated pairs already
+    # score ~0.55-0.63, good matches ~0.70-0.77
+    min_text_sim = 0.55
+    max_text_sim = 0.78
     # model-card task prefix for search queries; images take no prefix
     query_prompt = "task: search result | query: "
-    # images per forward pass: each is a 2520-patch sequence for the vision tower, so
-    # memory grows fast (~0.25 GB per image on MPS) while throughput is flat beyond 8
     max_batch = 8
 
     def __init__(self, huggingface_model: str):
