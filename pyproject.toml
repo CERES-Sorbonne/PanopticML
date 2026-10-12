@@ -33,7 +33,7 @@ dependencies = [
     "torchvision",
     "transformers>=5.19",
     "accelerate",  # needed by transformers for device_map
-    "faiss-cpu<1.11.0",
+    "faiss-cpu",
     "scikit-learn",
     "scipy",
     "numpy",
