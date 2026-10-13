@@ -1,6 +1,7 @@
 import functools
 import gc
 import math
+import os
 import threading
 
 import torch
@@ -8,7 +9,7 @@ from PIL import Image
 import numpy as np
 
 from panoptic.core.databases.media.models import VectorType
-from ..utils import resolve_device
+from ..utils import disable_mps, resolve_device
 
 
 def _unwrap_model_output(features) -> torch.Tensor:
@@ -85,11 +86,32 @@ def get_transformer(huggingface_model: str) -> 'Transformer':
     # Apple MobileCLIP repos ship a raw open_clip checkpoint and no transformers config,
     # so AutoConfig can't detect them: route them by name first.
     if 'mobileclip' in huggingface_model.lower():
-        return MobileClipTransformer(huggingface_model)
-    model_type = get_model_type(huggingface_model)
-    if model_type in type_to_class_mapping:
-        return type_to_class_mapping[model_type](huggingface_model)
-    return AutoTransformer(huggingface_model)
+        cls = MobileClipTransformer
+    else:
+        cls = type_to_class_mapping.get(get_model_type(huggingface_model), AutoTransformer)
+    if resolve_device() != 'mps' or os.environ.get('PANOPTICML_DEVICE', '').strip():
+        return cls(huggingface_model)
+    try:
+        transformer = cls(huggingface_model)
+        _check_forward(transformer)
+        return transformer
+    except Exception as e:
+        # some Apple GPUs (e.g. the virtualized ones of CI runners) can't compile every
+        # Metal kernel torch needs: compute on the CPU rather than fail every vector
+        import logging
+        logging.getLogger('PanopticML').warning(
+            f"PanopticML: MPS failed for {huggingface_model!r} ({e}), falling back to CPU")
+        disable_mps()
+        gc.collect()
+        torch.mps.empty_cache()
+        return cls(huggingface_model)
+
+
+def _check_forward(transformer: 'Transformer') -> None:
+    size = transformer.preprocess_size
+    vector = transformer.forward_from_arrays([np.full((size, size, 3), 127, dtype=np.uint8)])
+    if not np.isfinite(vector).all():
+        raise RuntimeError("non-finite vector")
 
 
 # ---------------------------------------------------------------------------

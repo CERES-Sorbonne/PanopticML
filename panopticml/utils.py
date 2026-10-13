@@ -76,6 +76,15 @@ def similarity_matrix(vectors1: list[np.array], vectors2: list[np.array], multip
         #
         # return scores_list, indices_list
 
+_mps_disabled = False
+
+
+def disable_mps() -> None:
+    """MPS failed on this machine (see get_transformer): later models use the CPU."""
+    global _mps_disabled
+    _mps_disabled = True
+
+
 def resolve_device() -> str:
     import logging
     logger = logging.getLogger('PanopticML')
@@ -88,7 +97,7 @@ def resolve_device() -> str:
     if torch.cuda.is_available():
         logger.info("PanopticML: using CUDA")
         return 'cuda'
-    if torch.backends.mps.is_available():
+    if torch.backends.mps.is_available() and not _mps_disabled:
         logger.info("PanopticML: using MPS (Apple Silicon)")
         return 'mps'
     logger.info("PanopticML: using CPU")

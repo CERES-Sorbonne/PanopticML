@@ -292,3 +292,61 @@ def test_file_lock(tmp_path):
         pytest.skip("Core ML conversion lock: macOS only")
     with E._file_lock(tmp_path / 'x.lock'):
         pass
+
+
+# ---------------------------------------------------------------------------
+# MPS fallback: a GPU that can't run the model falls back to the CPU
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def fake_mps(monkeypatch):
+    """A Mac whose MPS backend is available; `broken` makes every MPS forward fail."""
+    from panopticml import utils
+    from panopticml.compute import transformer as T
+
+    monkeypatch.delenv('PANOPTICML_DEVICE', raising=False)
+    monkeypatch.setattr(utils, '_mps_disabled', False)
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
+    monkeypatch.setattr(torch.backends.mps, 'is_available', lambda: True)
+    monkeypatch.setattr(torch.mps, 'empty_cache', lambda: None)
+    monkeypatch.setattr(T, 'get_model_type', lambda name: 'fake')
+    state = {'broken': False, 'built_on': []}
+
+    class Fake:
+        preprocess_size = 8
+
+        def __init__(self, name):
+            self.device = utils.resolve_device()
+            state['built_on'].append(self.device)
+
+        def forward_from_arrays(self, arrays):
+            if self.device == 'mps' and state['broken']:
+                raise RuntimeError("Failed to created pipeline state object")
+            return np.ones((len(arrays), 4), dtype=np.float32)
+
+    monkeypatch.setitem(T.type_to_class_mapping, 'fake', Fake)
+    return T, state
+
+
+def test_mps_kept_when_it_works(fake_mps):
+    T, state = fake_mps
+    assert T.get_transformer('m').device == 'mps'
+    assert state['built_on'] == ['mps']
+
+
+def test_mps_failure_falls_back_to_cpu(fake_mps):
+    T, state = fake_mps
+    state['broken'] = True
+    assert T.get_transformer('m').device == 'cpu'
+    assert T.get_transformer('m2').device == 'cpu'
+    assert state['built_on'] == ['mps', 'cpu', 'cpu']
+
+
+def test_forced_mps_is_not_overridden(fake_mps, monkeypatch):
+    T, state = fake_mps
+    state['broken'] = True
+    monkeypatch.setenv('PANOPTICML_DEVICE', 'mps')
+    t = T.get_transformer('m')
+    assert t.device == 'mps'
+    with pytest.raises(RuntimeError):
+        t.forward_from_arrays([np.zeros((8, 8, 3), np.uint8)])
