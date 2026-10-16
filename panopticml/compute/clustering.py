@@ -37,6 +37,17 @@ def make_clusters(vectors: list[Vector], **kwargs) -> (list[list[str]], list[int
     return sorted_clusters, sorted_distances_scaled
 
 
+def _reduce_for_density(vectors, n_components=8, n_neighbors=15) -> np.ndarray:
+    # density estimates are meaningless on raw high-dim embeddings: compare in cosine
+    # space and project with UMAP (min_dist=0 keeps clusters compact) before HDBSCAN
+    reduced = vectors / np.maximum(np.linalg.norm(vectors, axis=1, keepdims=True), 1e-12)
+    if len(reduced) <= 4 * n_neighbors or reduced.shape[1] <= n_components:
+        return reduced
+    import umap  # imported lazily: ~2.4s of pynndescent/numba JIT setup
+    return umap.UMAP(n_components=n_components, n_neighbors=n_neighbors, min_dist=0.0,
+                     metric="cosine").fit_transform(reduced)
+
+
 def _make_clusters_faiss(vectors, nb_clusters=6, **kwargs) -> (np.ndarray, np.ndarray):
     def _make_single_kmean(vectors, nb_clusters):
         # use the GPU when faiss is built with GPU support (CUDA); stays False
@@ -53,8 +64,8 @@ def _make_clusters_faiss(vectors, nb_clusters=6, **kwargs) -> (np.ndarray, np.nd
     if nb_clusters == -1:
         # imported lazily: numba JIT setup costs ~1s and only this branch needs it
         from fast_hdbscan import HDBSCAN
-        clusterer = HDBSCAN(min_cluster_size=5)
-        indices = clusterer.fit_predict(vectors)
+        clusterer = HDBSCAN(min_cluster_size=max(5, len(vectors) // 200), min_samples=3)
+        indices = clusterer.fit_predict(_reduce_for_density(vectors))
         # indices = clusterer.labels_
         probabilities = clusterer.probabilities_
         distances = np.zeros_like(probabilities, dtype=np.float32)
