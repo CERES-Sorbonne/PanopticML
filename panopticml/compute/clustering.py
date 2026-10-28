@@ -51,9 +51,10 @@ def _reduce_for_density(vectors, n_components=8, n_neighbors=15) -> np.ndarray:
 def _make_clusters_faiss(vectors, nb_clusters=6, **kwargs) -> (np.ndarray, np.ndarray):
     def _make_single_kmean(vectors, nb_clusters):
         # use the GPU when faiss is built with GPU support (CUDA); stays False
-        # on CPU-only / MPS installs so this never breaks those environments.
+        # on CPU-only and Apple Metal builds (faiss >= 1.15 reports Metal GPUs but
+        # Kmeans(gpu=True) needs the CUDA-only GpuResourcesVector).
         try:
-            use_gpu = faiss.get_num_gpus() > 0
+            use_gpu = hasattr(faiss, "GpuResourcesVector") and faiss.get_num_gpus() > 0
         except Exception:
             use_gpu = False
         kmean = faiss.Kmeans(vectors.shape[1], nb_clusters, niter=20, verbose=False, gpu=use_gpu)
