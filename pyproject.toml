@@ -29,7 +29,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "torch",
+    "torch>=2.6.0",
     "torchvision",
     "transformers>=5.19",
     "accelerate",  # needed by transformers for device_map
