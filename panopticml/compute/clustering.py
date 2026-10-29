@@ -1,3 +1,5 @@
+import logging
+
 import faiss
 import numpy as np
 import torch
@@ -50,14 +52,23 @@ def _reduce_for_density(vectors, n_components=8, n_neighbors=15) -> np.ndarray:
 
 def _make_clusters_faiss(vectors, nb_clusters=6, **kwargs) -> (np.ndarray, np.ndarray):
     def _make_single_kmean(vectors, nb_clusters):
-        # use the GPU when faiss is built with GPU support (CUDA); stays False
-        # on CPU-only and Apple Metal builds (faiss >= 1.15 reports Metal GPUs but
-        # Kmeans(gpu=True) needs the CUDA-only GpuResourcesVector).
+        # Try the GPU when faiss reports one (CUDA/ROCm, or Metal since faiss 1.15),
+        # and fall back to CPU if it fails. On faiss <= 1.15.1 the Metal build reports
+        # a GPU but Kmeans(gpu=True) raises NameError on the CUDA-only
+        # GpuResourcesVector; fixed upstream in facebookresearch/faiss#5747.
         try:
-            use_gpu = hasattr(faiss, "GpuResourcesVector") and faiss.get_num_gpus() > 0
+            use_gpu = faiss.get_num_gpus() > 0
         except Exception:
             use_gpu = False
-        kmean = faiss.Kmeans(vectors.shape[1], nb_clusters, niter=20, verbose=False, gpu=use_gpu)
+        if use_gpu:
+            try:
+                kmean = faiss.Kmeans(vectors.shape[1], nb_clusters, niter=20, verbose=False, gpu=True)
+                kmean.train(vectors)
+                return kmean.index.search(vectors, 1)
+            except Exception as e:
+                logging.getLogger(__name__).warning(
+                    "faiss GPU k-means failed (%s: %s), falling back to CPU", type(e).__name__, e)
+        kmean = faiss.Kmeans(vectors.shape[1], nb_clusters, niter=20, verbose=False, gpu=False)
         kmean.train(vectors)
         return kmean.index.search(vectors, 1)
 
