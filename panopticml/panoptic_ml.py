@@ -22,7 +22,7 @@ from panoptic.core.databases.media.models import Map, Vector, VectorType
 from .compute import make_clusters
 from .compute.clustering import cluster_by_text
 from .compute.faiss_tree import FaissTreeManager
-from .compute.transformer import TransformerManager
+from .compute.transformer import TransformerManager, supports_high_resolution
 from .compute_vector_task import ComputeVectorsTask
 from .utils import is_image_url, ClusterByTagsEnum, process_tags, normalize_positions
 
@@ -79,7 +79,12 @@ class PanopticML(APlugin):
         self.params = PluginParams()
         self.project.on_import_complete(self._on_import)
         self.project.on_folder_delete(self._on_folder_delete)
-        self.add_action_easy(self.create_default_vector_type, ['vector_type'])
+        visible_if = {'high_resolution': {'model': [ModelEnum.dinov3.value]},
+                      'keep_ratio': {'model': [ModelEnum.siglip.value]}}
+        try:
+            self.add_action_easy(self.create_default_vector_type, ['vector_type'], visible_if=visible_if)
+        except TypeError:   # Panoptic without conditional params: every option is shown
+            self.add_action_easy(self.create_default_vector_type, ['vector_type'])
         self.add_action_easy(self.create_custom_vector_type, ['vector_type'])
         self.add_action_easy(self.compute_vectors, ['vector'])
         self.add_action_easy(self.find_images, ['similar'])
@@ -101,7 +106,7 @@ class PanopticML(APlugin):
         if len(self.vector_types) == 0:
             vt = self.project.upsert_vector_type(
                 VectorType(id=-1, source=self.name,
-                           params={"model": ModelEnum.clip.value, "greyscale": False})
+                           params={"model": ModelEnum.clip.value, "greyscale": False, "keep_ratio": True})
             )
             self.vector_types.append(vt)
 
@@ -132,19 +137,23 @@ class PanopticML(APlugin):
     # Vector type creation
     # ------------------------------------------------------------------
 
-    def create_default_vector_type(self, ctx: ActionContext, model: ModelEnum = ModelEnum.clip, greyscale: bool = False) -> ActionResult:
+    def create_default_vector_type(self, ctx: ActionContext, model: ModelEnum = ModelEnum.clip, greyscale: bool = False,
+                                   high_resolution: bool = False, keep_ratio: bool = True) -> ActionResult:
         """Create a vector type using a predefined model.
         @model: the embedding model to use
         @greyscale: convert images to greyscale before embedding
+        @high_resolution: embed at 768px keeping the aspect ratio (about 12x slower)
+        @keep_ratio: keep the aspect ratio of the images. On Apple Silicon, untick it to also use the Neural Engine
         """
-        vt = VectorType(id=-1, source=self.name, params={"model": model.value, "greyscale": greyscale})
-        res = self.project.upsert_vector_type(vt)
-        return ActionResult(value=msgspec.structs.asdict(res))
+        return self._create_vector_type(model.value, greyscale, high_resolution, keep_ratio)
 
-    def create_custom_vector_type(self, ctx: ActionContext, model: str = '', greyscale: bool = False) -> ActionResult:
+    def create_custom_vector_type(self, ctx: ActionContext, model: str = '', greyscale: bool = False,
+                                  high_resolution: bool = False, keep_ratio: bool = True) -> ActionResult:
         """Create a vector type using a custom HuggingFace model name.
         @model: HuggingFace model identifier (e.g. openai/clip-vit-base-patch32)
         @greyscale: convert images to greyscale before embedding
+        @high_resolution: embed at 768px keeping the aspect ratio (DINOv3 models only, about 12x slower)
+        @keep_ratio: keep the aspect ratio of the images (NaFlex models only, e.g. SigLIP2 naflex). On Apple Silicon, untick it to also use the Neural Engine
         """
         model = model.strip()
         if not model:
@@ -152,7 +161,19 @@ class PanopticML(APlugin):
                 NotifType.ERROR, name="EmptyModel",
                 message="Please provide a HuggingFace model identifier",
             )])
-        vt = VectorType(id=-1, source=self.name, params={"model": model, "greyscale": greyscale})
+        return self._create_vector_type(model, greyscale, high_resolution, keep_ratio)
+
+    def _create_vector_type(self, model: str, greyscale: bool, high_resolution: bool,
+                            keep_ratio: bool) -> ActionResult:
+        if high_resolution and not supports_high_resolution(model):
+            return ActionResult(notifs=[Notif(
+                NotifType.ERROR, name="HighResolutionNotSupported",
+                message="The high resolution option is only available for DINOv3 models",
+            )])
+        # stored even when False: types created before the option squash images like keep_ratio=False
+        vt = VectorType(id=-1, source=self.name,
+                        params={"model": model, "greyscale": greyscale, "high_resolution": high_resolution,
+                                "keep_ratio": keep_ratio})
         res = self.project.upsert_vector_type(vt)
         return ActionResult(value=msgspec.structs.asdict(res))
 

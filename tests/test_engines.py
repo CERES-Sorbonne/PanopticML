@@ -18,7 +18,7 @@ import torch  # noqa: F401  before faiss, see panopticml/compute/__init__.py
 from PIL import Image
 
 from panopticml.compute.accel import engines as E
-from panopticml.compute_vector_task import ComputeVectorsTask, _preprocess_worker
+from panopticml.compute_vector_task import ComputeVectorsTask, _fit_long_side, _preprocess_worker
 from panopticml.panoptic_ml import ModelEnum
 
 APPLE_SILICON = sys.platform == 'darwin' and platform.machine() == 'arm64'
@@ -114,6 +114,59 @@ def _run_task(monkeypatch, transformer, engines, n=40):
     task, project = _make_task(monkeypatch, transformer, engines, n)
     task.start()
     return task, project
+
+
+@pytest.mark.parametrize("size,expected", [
+    ((1000, 750), (768, 576)),    # downscaled, ratio kept
+    ((750, 1000), (576, 768)),
+    ((256, 180), (256, 176)),     # small rendition: never upscaled to the long side
+    ((5000, 10), (768, 16)),      # at least one patch
+])
+def test_fit_long_side(size, expected):
+    assert _fit_long_side(*size, 768, 16) == expected
+
+
+def _png(width, height):
+    buf = io.BytesIO()
+    Image.new('RGB', (width, height), (width % 256, height % 256, 0)).save(buf, 'PNG')
+    return buf.getvalue()
+
+
+def test_high_resolution_batches_images_of_the_same_shape(monkeypatch):
+    t = FakeTransformer()
+    t.high_resolution_size, t.patch_size = 8, 4
+    engine = FakeEngine(t, 'gpu')
+    shapes = []
+    forward = engine.forward
+    sizes = []
+    engine.forward = lambda arrays: (shapes.append({a.shape for a in arrays}), sizes.append(len(arrays)),
+                                     forward(arrays))[2]
+    task, project = _make_task(monkeypatch, t, [engine], n=0)
+    project.images = {f'{w}x{h}': _png(w, h) for w in (16, 15, 17) for h in (8, 9, 16, 7)}
+    task.instances = [SimpleNamespace(sha1=s) for s in project.images]
+    task.vec_type.params['high_resolution'] = True
+    task.start()
+    assert len(project.vectors) == 12
+    assert all(len(s) == 1 for s in shapes) and len(set.union(*shapes)) == 2
+    assert max(sizes) > 1
+
+
+def test_keep_ratio_batches_every_shape_together_without_the_neural_engine(monkeypatch):
+    t = FakeTransformer()
+    t.patch_sequence = True
+    engine = FakeEngine(t, 'gpu')
+    shapes, asked = [], []
+    forward = engine.forward
+    engine.forward = lambda arrays: (shapes.append({a.shape for a in arrays}), forward(arrays))[1]
+    task, project = _make_task(monkeypatch, t, [engine], n=0)
+    monkeypatch.setattr('panopticml.compute_vector_task.get_engines',
+                        lambda t, neural_engine=True: (asked.append(neural_engine), [engine])[1])
+    project.images = {f'{w}x{h}': _png(w, h) for w, h in ((32, 8), (8, 32), (16, 16), (64, 4))}
+    task.instances = [SimpleNamespace(sha1=s) for s in project.images]
+    task.vec_type.params['keep_ratio'] = True
+    task.start()
+    assert asked == [False] and len(project.vectors) == 4
+    assert set.union(*shapes) == {(4, 16, 3), (16, 4, 3), (16, 16, 3), (1, 16, 3)} and len(shapes) == 1
 
 
 def test_task_is_followed_from_its_vector_type(monkeypatch):

@@ -107,6 +107,14 @@ def get_transformer(huggingface_model: str) -> 'Transformer':
         return cls(huggingface_model)
 
 
+def supports_high_resolution(huggingface_model: str) -> bool:
+    try:
+        cls = type_to_class_mapping.get(get_model_type(huggingface_model), AutoTransformer)
+    except Exception:
+        return False
+    return cls.high_resolution_size is not None
+
+
 def _check_forward(transformer: 'Transformer') -> None:
     size = transformer.preprocess_size
     vector = transformer.forward_from_arrays([np.full((size, size, 3), 127, dtype=np.uint8)])
@@ -127,6 +135,8 @@ class Transformer:
     mps_dtype: torch.dtype | None = None
     # images per GPU forward pass; None: chosen from the model's size (see batch_size)
     preferred_batch: int | None = None
+    # long side of the `high_resolution` option; None: the model only takes preprocess_size
+    high_resolution_size: int | None = None
 
     def __init__(self, huggingface_model: str):
         from transformers import logging
@@ -377,9 +387,11 @@ class Dinov3Transformer(Dinov2Transformer):
     """
     # DINOv3 activations overflow fp16: every vector comes out NaN
     cuda_dtype = torch.bfloat16
+    high_resolution_size = 768
 
     def __init__(self, huggingface_model: str):
         super().__init__(huggingface_model)
+        self.patch_size = self.model.config.patch_size
         # CLS + register tokens, skipped when falling back to patch mean-pooling
         num_register = getattr(self.model.config, 'num_register_tokens', 0) or 0
         self._num_prefix_tokens = 1 + num_register

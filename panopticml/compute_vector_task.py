@@ -48,14 +48,22 @@ def _pick_image_type(image_types: list[ImageType], input_size: int) -> int:
     return min(big_enough)[1] if big_enough else max(sized)[1]
 
 
-def _preprocess_worker(args: tuple):
-    """Decode + resize one stored image. Returns (sha1, array, None), or (sha1, None, error)."""
+def _fit_long_side(width: int, height: int, size: int, patch_size: int) -> tuple[int, int]:
+    """Aspect ratio kept, long side at most `size`, both sides multiples of `patch_size`."""
+    scale = min(1.0, size / max(width, height))
+    return tuple(max(patch_size, round(side * scale / patch_size) * patch_size) for side in (width, height))
+
+
+def _preprocess_worker(args: tuple, patch_size: int | None = None):
+    """Decode + resize one stored image, to a `size` square or, with `patch_size`, keeping
+    its aspect ratio. Returns (sha1, array, None), or (sha1, None, error)."""
     sha1, jpeg_bytes, size, greyscale = args
     try:
         img = Image.open(io.BytesIO(jpeg_bytes))
         img = img.convert('L').convert('RGB') if greyscale else img.convert('RGB')
-        if img.size != (size, size):
-            img = img.resize((size, size), Image.BICUBIC)
+        target = _fit_long_side(*img.size, size, patch_size) if patch_size else (size, size)
+        if img.size != target:
+            img = img.resize(target, Image.BICUBIC)
         return sha1, np.asarray(img, dtype=np.uint8), None
     except Exception as e:
         return sha1, None, e
@@ -114,9 +122,14 @@ class ComputeVectorsTask(Task):
         if not sha1s:
             return
 
-        engines = get_engines(self.transformer, neural_engine=self.plugin.params.neural_engine)
+        # the Neural Engine models are compiled for the square patch grid
+        engines = get_engines(self.transformer,
+                              neural_engine=self.plugin.params.neural_engine and not self._keeps_ratio())
         # the GPU engine's batch: small enough that engines share the work evenly
         self._batch_size = engines[0].batch_size
+        high_res = self._high_resolution_size()
+        if high_res:   # same number of patches per forward pass as at the model's input size
+            self._batch_size = max(1, self._batch_size * self.transformer.preprocess_size ** 2 // high_res ** 2)
         batch_queue = Queue(maxsize=PREFETCH_QUEUED * len(engines))
         write_queue = Queue(maxsize=WRITE_QUEUED)
 
@@ -160,6 +173,15 @@ class ComputeVectorsTask(Task):
         if self._fail_reasons:
             lines = '\n'.join(f"  {n:>8}  {reason}" for reason, n in self._fail_reasons.most_common())
             print(f"[PanopticML] {self.name}: {self.state.failed} image(s) failed:\n{lines}\n")
+
+    def _high_resolution_size(self) -> int | None:
+        if self.vec_type.params.get('high_resolution'):
+            return self.transformer.high_resolution_size
+        return None
+
+    def _keeps_ratio(self) -> bool:
+        """NaFlex models (patch sequence) take images with their own aspect ratio."""
+        return bool(self.vec_type.params.get('keep_ratio')) and getattr(self.transformer, 'patch_sequence', False)
 
     def on_last(self) -> None:
         self.plugin.rebuild_index(self.vec_type)
@@ -221,7 +243,15 @@ class ComputeVectorsTask(Task):
     # ------------------------------------------------------------------
 
     def _producer(self, sha1s: list[str], out: Queue) -> None:
-        size      = self.transformer.preprocess_size
+        high_res   = self._high_resolution_size()
+        keep_ratio = self._keeps_ratio()
+        size       = self.transformer.preprocess_size
+        patch_size = None
+        if high_res:
+            size, patch_size = high_res, self.transformer.patch_size
+        elif keep_ratio:
+            # the processor fits the patch budget itself: an elongated image can need twice the side
+            size, patch_size = 2 * size, 1
         greyscale = self.vec_type.params.get('greyscale', False)
 
         try:
@@ -235,8 +265,9 @@ class ComputeVectorsTask(Task):
             )
 
             with ThreadPoolExecutor(max_workers=IO_WORKERS, thread_name_prefix='panopticml-decode') as pool:
-                batch_sha1s:  list[str] = []
-                batch_arrays: list      = []
+                # with the aspect ratio kept, only images of the same shape can share a batch,
+                # except for NaFlex: the processor pads every image to the same patch budget
+                batches: dict[tuple, tuple[list[str], list]] = {}
 
                 for i in range(0, len(sha1s), FETCH_BATCH):
                     if self.is_cancelled():
@@ -258,7 +289,7 @@ class ComputeVectorsTask(Task):
                             f"e.g. sha1 {missing[0]}",
                         )
 
-                    futures = [pool.submit(_preprocess_worker, a) for a in args_list]
+                    futures = [pool.submit(_preprocess_worker, a, patch_size) for a in args_list]
                     for fut in as_completed(futures):
                         if self.is_cancelled():
                             break
@@ -269,16 +300,16 @@ class ComputeVectorsTask(Task):
                                 f"sha1 {sha1}: {error}",
                             )
                             continue
+                        key = None if keep_ratio else arr.shape
+                        batch_sha1s, batch_arrays = batches.setdefault(key, ([], []))
                         batch_sha1s.append(sha1)
                         batch_arrays.append(arr)
 
                         if len(batch_sha1s) >= self._batch_size:
-                            out.put((batch_sha1s, batch_arrays))
-                            batch_sha1s  = []
-                            batch_arrays = []
+                            out.put(batches.pop(key))
 
-                if batch_sha1s:
-                    out.put((batch_sha1s, batch_arrays))
+                for batch in batches.values():
+                    out.put(batch)
         except Exception:
             print(f"[PanopticML] {self.name}: image loading failed\n{traceback.format_exc()}")
         finally:
